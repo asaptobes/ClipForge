@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+build/
+dist/
+dist_new/
+vendor/
+*.zip
+*.log
+.claude/settings.local.json
