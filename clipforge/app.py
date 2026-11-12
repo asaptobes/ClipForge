@@ -61,17 +61,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     settings = Settings.load()
     theme.apply_theme(app, settings.theme)
-    styler = TitleBarStyler(dark=settings.theme != "light", parent=app)
-    app.installEventFilter(styler)
     icon_file = paths.resource_path("icon.ico")
+    if not icon_file.is_file():
+        icon_file = paths.resource_path("icon.png")
     if icon_file.is_file():
         app.setWindowIcon(QIcon(str(icon_file)))
+    styler = TitleBarStyler(dark=settings.theme != "light", parent=app)
+    app.installEventFilter(styler)
+
+    # splash first, so it is on screen while the heavy imports and the window are built
+    from .ui import splash as splash_mod
+    splash = None
+    if splash_mod.splash_allowed(smoke_test=args.smoke_test, export_test=bool(args.export_test)):
+        splash = splash_mod.create_splash()
+        if splash is not None:
+            splash.show_now()
+            splash.set_status("Loading…", 0.15)
 
     try:
         from .ui.main_window import MainWindow
+        if splash is not None:
+            splash.set_status("Starting the editor…", 0.5)
         window = MainWindow(settings)
     except Exception as exc:  # noqa: BLE001 - show something instead of dying silently
         log.critical("Start-up failed", exc_info=True)
+        if splash is not None:
+            splash.close()
         if args.smoke_test:
             return 2
         QMessageBox.critical(None, __app_name__,
@@ -79,8 +94,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     window.show()
+    if splash is not None:
+        splash.finish(window)
     if args.path:
         QTimer.singleShot(100, lambda: window.open_path(os.path.abspath(args.path)))
+
+    from .ui.support_dialog import prompt_allowed, show_support_dialog
+    if prompt_allowed(settings, smoke_test=args.smoke_test, export_test=bool(args.export_test)):
+        QTimer.singleShot(600,
+                          lambda: show_support_dialog(settings, window))
 
     if args.smoke_test:
         from .media import ffmpeg

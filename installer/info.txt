@@ -1,0 +1,5 @@
+ClipForge downloads videos and lets you edit them on a timeline.
+
+Only download or edit content that you own or have permission to use. You are responsible for complying with the terms of the services you download from and with applicable copyright law.
+
+Your settings, cache and logs are stored in %APPDATA%\ClipForge and %LOCALAPPDATA%\ClipForge and are not touched by updates or by uninstalling.

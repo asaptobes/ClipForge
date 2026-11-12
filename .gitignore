@@ -9,3 +9,4 @@ vendor/
 *.zip
 *.log
 .claude/settings.local.json
+build_new/

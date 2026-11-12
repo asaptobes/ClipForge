@@ -36,6 +36,7 @@ class Settings:
     splitter_main: str = ""
     splitter_vertical: str = ""
     volume: float = 1.0
+    show_support_prompt: bool = True
 
     _path: Optional[Path] = field(default=None, repr=False, compare=False)
 

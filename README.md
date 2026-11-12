@@ -17,6 +17,20 @@ Built with Python 3.12, PySide6, yt-dlp, FFmpeg and PyInstaller.
 - Save and open projects as `.clipforge` files. Missing media can be relinked.
 - Light, dark and midnight themes.
 
+## Install
+
+1. Download `ClipForge-Setup-x.y.z.exe` from the [GitHub Releases page](https://github.com/asaptobes/ClipForge/releases).
+2. Run it and follow the wizard. It installs for the current user by default and needs no administrator rights; choose "all users" in the prompt if you want a machine-wide install. You can add a desktop shortcut and associate `.clipforge` project files with ClipForge.
+3. Start ClipForge from the Start menu.
+
+**SmartScreen warning.** The installer is not code-signed yet, so Windows SmartScreen may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+
+Updating: run a newer setup over the existing install. Your settings (`%APPDATA%\ClipForge`) and cache and logs (`%LOCALAPPDATA%\ClipForge`) are kept on update and on uninstall. Uninstall from Windows Settings > Apps.
+
+**Portable alternative.** Download `ClipForge-x.y.z-win64.zip`, extract the whole folder anywhere and run `ClipForge.exe`. No installation is needed.
+
+**Build the installer from source.** Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), then run `.\build.ps1 -Installer`. The result is `dist\ClipForge-Setup-<version>.exe`. See [Building the exe](#building-the-exe).
+
 ## Quick start (end users)
 
 No Python installation is needed.
@@ -216,6 +230,14 @@ To also create a zip archive, `dist\ClipForge-<version>-win64.zip`:
 ```powershell
 .\build.ps1 -SkipTests -Zip
 ```
+
+To build the Windows installer (needs Inno Setup 6), `dist\ClipForge-Setup-<version>.exe`:
+
+```powershell
+.\build.ps1 -SkipTests -Installer
+```
+
+The version comes from `clipforge\__init__.py`. The wizard images in `installer\` are generated from the logo by `installer\make_wizard_images.py` and are committed, so the build does not need Pillow.
 
 Omit `-SkipTests` if you want the build to stop when tests fail.
 

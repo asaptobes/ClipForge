@@ -7,14 +7,15 @@ import os
 import shutil
 from typing import Optional
 
-from PySide6.QtCore import Slot
-from PySide6.QtWidgets import (QComboBox, QDialog, QGridLayout, QHBoxLayout, QMessageBox,
+from PySide6.QtCore import Qt, Slot
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QGridLayout, QHBoxLayout, QMessageBox,
                                QVBoxLayout, QWidget)
 
 from .. import __app_name__, __version__, paths
 from ..media import ffmpeg
 from ..core.timecode import format_size
 from ..settings import Settings
+from .support_dialog import open_support_page
 from .widgets import (DOT, PathField, folder_problem, heading, hseparator, make_label,
                       open_path, plain_button, primary_button, run_task)
 
@@ -136,6 +137,15 @@ class SettingsDialog(QDialog):
         self._add_row("Theme", self.theme_combo)
         self._add_row("", make_label("The theme is applied everywhere after ClipForge restarts.",
                                      "faint", wrap=True, shrinkable=False))
+        self._section("Support")
+        self.support_check = QCheckBox("Show the thank-you message at startup")
+        self._add_row("", self.support_check)
+        self.support_button = plain_button("Support ClipForge ☕", variant="ghost")
+        self.support_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        support_row = QHBoxLayout()
+        support_row.addWidget(self.support_button)
+        support_row.addStretch(1)
+        self._add_row("", support_row)
         root.addLayout(grid)
 
         self.error_label = make_label("", "error", wrap=True, shrinkable=False)
@@ -170,6 +180,7 @@ class SettingsDialog(QDialog):
         self.restore_button.clicked.connect(self.restore_defaults)
         self.clear_cache_button.clicked.connect(self.clear_cache)
         self.log_button.clicked.connect(self._open_logs)
+        self.support_button.clicked.connect(open_support_page)
         self.cache_field.changed.connect(lambda _p: self._refresh_cache_size())
         for field in self.path_fields():
             field.changed.connect(lambda _p: self.error_label.setVisible(False))
@@ -204,6 +215,7 @@ class SettingsDialog(QDialog):
         _select(self.codec_combo, s.export_codec)
         _select(self.hw_combo, s.hw_accel)
         _select(self.theme_combo, s.theme)
+        self.support_check.setChecked(s.show_support_prompt)
 
     def restore_defaults(self) -> None:
         """Reset the form to the factory defaults (applied only when saved)."""
@@ -235,6 +247,7 @@ class SettingsDialog(QDialog):
         s.export_codec = str(self.codec_combo.currentData())
         s.hw_accel = str(self.hw_combo.currentData())
         s.theme = str(self.theme_combo.currentData())
+        s.show_support_prompt = self.support_check.isChecked()
         s.save()
         self.accept()
         return True

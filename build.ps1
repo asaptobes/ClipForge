@@ -8,6 +8,7 @@
     3. Runs the test suite (skip with -SkipTests).
     4. Builds dist\ClipForge\ClipForge.exe and smoke-tests the packaged app.
     5. Optionally zips it (-Zip) to dist\ClipForge-<version>-win64.zip.
+    6. Optionally builds the Inno Setup installer (-Installer) to dist\ClipForge-Setup-<version>.exe.
 
 .EXAMPLE
     .\build.ps1
@@ -15,7 +16,8 @@
 #>
 param(
     [switch]$SkipTests,
-    [switch]$Zip
+    [switch]$Zip,
+    [switch]$Installer
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,4 +95,30 @@ if ($Zip) {
     if (Test-Path $zipOut) { Remove-Item $zipOut -Force }
     Compress-Archive -Path (Join-Path $root "dist\ClipForge") -DestinationPath $zipOut
     Write-Host "Created $zipOut" -ForegroundColor Green
+}
+
+if ($Installer) {
+    Step "Building the installer (Inno Setup)"
+    $iscc = $null
+    $cmd = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($cmd) { $iscc = $cmd.Source }
+    foreach ($candidate in @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"))) {
+        if (-not $iscc -and (Test-Path $candidate)) { $iscc = $candidate }
+    }
+    if (-not $iscc) {
+        throw "Inno Setup 6 (ISCC.exe) was not found. Install it with: winget install JRSoftware.InnoSetup"
+    }
+    $version = (& $py -c "import clipforge; print(clipforge.__version__)").Trim()
+    $ErrorActionPreference = "Continue"
+    & $iscc /Qp "/DAppVersion=$version" (Join-Path $root "installer\ClipForge.iss") 2>&1 | ForEach-Object { "$_" }
+    $isccExit = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($isccExit -ne 0) { throw "Inno Setup failed (exit code $isccExit)" }
+    $setup = Join-Path $root "dist\ClipForge-Setup-$version.exe"
+    if (-not (Test-Path $setup)) { throw "Inno Setup finished but $setup is missing" }
+    $setupMb = [math]::Round((Get-Item $setup).Length / 1MB, 0)
+    Write-Host "Created $setup ($setupMb MB)" -ForegroundColor Green
 }
