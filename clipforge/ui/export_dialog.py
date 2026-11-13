@@ -446,10 +446,25 @@ class ExportDialog(QDialog):
         )
 
     def segments(self) -> list:
-        """Clips (video lane, then audio lane) the current scope exports."""
+        """Clips (video tracks, then audio lane) the current scope exports. Clips on hidden
+        video tracks are never exported."""
         if self.scope_selection.isChecked():
-            return self.document.selected_segments()
-        return list(self.document.timeline.all_segments())
+            segs = self.document.selected_segments()
+        else:
+            segs = list(self.document.timeline.all_segments())
+        hidden = self.document.timeline.track_hidden
+        return [s for s in segs if s.is_audio or s.layer not in hidden] if hidden else segs
+
+    def _hidden_clip_count(self) -> int:
+        """Clips of the current scope that sit on hidden tracks (left out of the export)."""
+        hidden = self.document.timeline.track_hidden
+        if not hidden:
+            return 0
+        if self.scope_selection.isChecked():
+            pool = self.document.selected_segments()
+        else:
+            pool = self.document.timeline.video_segments()
+        return sum(1 for s in pool if not s.is_audio and s.layer in hidden)
 
     def _video_segments(self) -> list:
         """The picture clips of the current scope (these decide the output size)."""
@@ -515,7 +530,7 @@ class ExportDialog(QDialog):
         self.size_label.setText(f"→ {w}×{h}" if w and h else "")
         segs = self.segments()
         dur = 0.0
-        if segs and not self.scope_selection.isChecked():
+        if segs and not self.scope_selection.isChecked() and not self.document.timeline.track_hidden:
             dur = self.document.duration
         elif segs:
             dur = max(s.timeline_end for s in segs) - min(s.timeline_start for s in segs)
@@ -526,6 +541,9 @@ class ExportDialog(QDialog):
             parts.append(format_duration(dur))
         name = self.collect_settings().filename
         parts.append(f"{len(segs)} clip{'s' if len(segs) != 1 else ''}")
+        skipped = self._hidden_clip_count()
+        if skipped:
+            parts.append(f"{skipped} hidden-track clip{'s' if skipped != 1 else ''} skipped")
         self.summary_label.setText("Output: " + DOT.join(parts) +
                                    (f"\n{self.output_path()}" if name else ""))
         self._refresh_captions_row()

@@ -202,13 +202,18 @@ class TimelineSnapshot(list):
     It is a plain ``list`` of :class:`Segment` for everything that only reads clips.
     """
 
-    def __init__(self, segments: Iterable[Segment] = (), track_count: int = 1) -> None:
+    def __init__(self, segments: Iterable[Segment] = (), track_count: int = 1,
+                 hidden: Iterable[int] = ()) -> None:
         super().__init__(segments)
         needed = max((s.layer for s in self if not s.is_audio), default=0) + 1
         self.track_count: int = max(1, int(track_count), needed)
+        #: indices of video tracks switched off (not previewed, not exported)
+        self.hidden: tuple[int, ...] = tuple(sorted(
+            {int(i) for i in hidden if 0 <= int(i) < self.track_count}))
 
     def __eq__(self, other) -> bool:
-        if isinstance(other, TimelineSnapshot) and other.track_count != self.track_count:
+        if isinstance(other, TimelineSnapshot) and (
+                other.track_count != self.track_count or other.hidden != self.hidden):
             return False
         return list.__eq__(self, other)
 
@@ -231,20 +236,26 @@ class Timeline:
     """
 
     def __init__(self, sources: Optional[dict[str, MediaSource]] = None,
-                 segments: Optional[Iterable[Segment]] = None, track_count: int = 1) -> None:
+                 segments: Optional[Iterable[Segment]] = None, track_count: int = 1,
+                 hidden: Iterable[int] = ()) -> None:
         self.sources: dict[str, MediaSource] = sources if sources is not None else {}
         self.video_tracks: list[list[Segment]] = [[]]
         self.audio: list[Segment] = []                                             # audio lane
-        self._distribute([s.copy() for s in (segments or [])], track_count)
+        #: indices of video tracks that are switched off (skipped by preview and export)
+        self.track_hidden: set[int] = set()
+        self._distribute([s.copy() for s in (segments or [])], track_count, hidden)
 
     # ------------------------------------------------------------------- lanes
-    def _distribute(self, everything: list[Segment], track_count: int) -> None:
+    def _distribute(self, everything: list[Segment], track_count: int,
+                    hidden: Iterable[int] = ()) -> None:
         videos = [s for s in everything if not s.is_audio]
         count = max(1, int(track_count), max((s.layer for s in videos), default=0) + 1)
         self.video_tracks = [[] for _ in range(count)]
         for s in videos:
             self.video_tracks[max(0, s.layer)].append(s)
         self.audio = [s for s in everything if s.is_audio]
+        # hiding only exists between several tracks (a lone V1 has nothing to be hidden from)
+        self.track_hidden = ({int(i) for i in hidden if 0 <= int(i) < count} if count > 1 else set())
         self._sort()
 
     def _sort(self) -> None:
@@ -280,6 +291,20 @@ class Timeline:
             raise EditError(f"No such video track: {index}")
         return self.video_tracks[index]
 
+    def is_track_hidden(self, index: int) -> bool:
+        return index in self.track_hidden
+
+    def set_track_hidden(self, index: int, hidden: bool) -> None:
+        """Switch a video track off (``hidden``) or on. Hidden tracks are neither previewed
+        nor exported; their clips stay on the timeline."""
+        self.track(index)
+        if len(self.video_tracks) < 2:
+            raise EditError("Add a second video track before hiding one.")
+        if hidden:
+            self.track_hidden.add(index)
+        else:
+            self.track_hidden.discard(index)
+
     def add_track(self, index: Optional[int] = None) -> int:
         """Insert an empty video track (default: on top). Returns its index."""
         count = len(self.video_tracks)
@@ -290,6 +315,7 @@ class Timeline:
         if count >= MAX_VIDEO_TRACKS:
             raise EditError(f"A project can have at most {MAX_VIDEO_TRACKS} video tracks.")
         self.video_tracks.insert(index, [])
+        self.track_hidden = {i + 1 if i >= index else i for i in self.track_hidden}
         self._sort()
         return index
 
@@ -310,6 +336,9 @@ class Timeline:
         elif lane and not delete_clips:
             raise EditError("The track still has clips. Delete or move them first.")
         del self.video_tracks[index]
+        self.track_hidden = {i - 1 if i > index else i for i in self.track_hidden if i != index}
+        if len(self.video_tracks) < 2:
+            self.track_hidden.clear()
         self._sort()
 
     # ------------------------------------------------------------------ queries
@@ -367,10 +396,13 @@ class Timeline:
                 return s
         return None
 
-    def segments_at(self, t: float) -> list[Segment]:
-        """Video clips under ``t`` on every track, bottom-to-top (compositing order)."""
+    def segments_at(self, t: float, visible_only: bool = False) -> list[Segment]:
+        """Video clips under ``t`` on every track, bottom-to-top (compositing order).
+        With ``visible_only`` the clips of hidden tracks are left out."""
         out = []
-        for lane in self.video_tracks:
+        for i, lane in enumerate(self.video_tracks):
+            if visible_only and i in self.track_hidden:
+                continue
             for s in lane:
                 if s.contains(t):
                     out.append(s)
@@ -429,11 +461,12 @@ class Timeline:
 
     def snapshot(self) -> TimelineSnapshot:
         """Copies of every clip on all lanes plus the number of video tracks."""
-        return TimelineSnapshot((s.copy() for s in self.all_segments()), len(self.video_tracks))
+        return TimelineSnapshot((s.copy() for s in self.all_segments()), len(self.video_tracks),
+                                self.track_hidden)
 
     def restore(self, snapshot: Iterable[Segment]) -> None:
         count = getattr(snapshot, "track_count", 1)
-        self._distribute([s.copy() for s in snapshot], count)
+        self._distribute([s.copy() for s in snapshot], count, getattr(snapshot, "hidden", ()))
 
     def _frame(self, seg: Segment) -> float:
         src = self.sources.get(seg.source_id)

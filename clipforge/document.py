@@ -303,6 +303,22 @@ class Document(QObject):
         self._committed("Remove track", before)
         return True
 
+    def is_track_hidden(self, index: int) -> bool:
+        return self.timeline.is_track_hidden(index)
+
+    def set_track_hidden(self, index: int, hidden: bool) -> bool:
+        """Show or hide a video track (hidden: not previewed, not exported). One undo step
+        ("Hide track" / "Show track"). Returns False when nothing changed."""
+        before = self.timeline.snapshot()
+        try:
+            self.timeline.set_track_hidden(index, hidden)
+        except EditError as exc:
+            return self._refuse(exc)
+        if before == self.timeline.snapshot():
+            return False
+        self._committed("Hide track" if hidden else "Show track", before)
+        return True
+
     def split_at_playhead(self) -> bool:
         """Split the selected clip(s) under the playhead, or else the clip under it."""
         t = self.playhead

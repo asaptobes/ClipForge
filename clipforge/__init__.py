@@ -1,4 +1,4 @@
 """ClipForge - YouTube video downloader and timeline editor for Windows."""
 
 __app_name__ = "ClipForge"
-__version__ = "1.3.0"
+__version__ = "1.3.1"

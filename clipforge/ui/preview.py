@@ -18,6 +18,14 @@ Engine design
 * Paused seeks ask the player for the *middle* of the wanted frame (measured: asking
   for the exact frame start yields the previous frame; the mid-frame request is exact).
 * ``J`` (``shuttle(-1)``) is implemented as "pause and jump back one second per press".
+* Turning a decoded frame into a ``QImage`` costs 10-100 ms for 1080p (hardware read-back +
+  colour conversion) and holds the interpreter lock even on a worker thread (measured), so
+  the work is reduced instead of moved: a player is only re-seeked once its previous seek
+  produced a picture (or ran out of patience), frames that are already on screen are not
+  converted again and a burst of frames is converted once.
+* Tracks switched off with the eye button (``Timeline.track_hidden``) are not drawn and not
+  heard: their overlay players are parked; a hidden V1 keeps running (it is the clock) but
+  its picture is replaced by black and its sound muted.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ GAP_FRAME = 1.0 / 30.0
 _TS_EPS = 0.002             # timestamp comparison slack (seconds)
 _END_EPS = 1e-4             # "at the end of the timeline"
 _SCRUB_COALESCE_MS = 60     # a newer paused seek waits this long for the previous one
+_SCRUB_PATIENCE_MS = 260    # ... or this long while overlay players compete for the decoder
 _SETTLE_MS = 400            # paused seek: exact frame expected within this time
 _PENDING_TIMEOUT_MS = 1500  # playing: stop waiting for the first frame after a seek
 _FRAME_CLOCK_MS = 250       # frames younger than this drive the playback clock
@@ -1633,6 +1642,7 @@ class _LayerPlayer:
         self.seek_wall = 0
         self.check_wall = 0
         self.image: Optional[QImage] = None
+        self.image_start = -1.0                  # source time of the frame behind ``image``
         self.player = QMediaPlayer(panel)
         self.sink = QVideoSink(panel)
         self.out: Optional[QAudioOutput] = None
@@ -1671,6 +1681,7 @@ class _LayerPlayer:
         self.loaded = self.ended = self.want_play = self.pending = False
         self.target = None
         self.image = None
+        self.image_start = -1.0
         if not self.dead:
             try:
                 self.player.stop()
@@ -1682,6 +1693,7 @@ class _LayerPlayer:
         """No clip on this layer right now: stop, mute and drop the picture."""
         self.seg_id = None
         self.image = None
+        self.image_start = -1.0
         self.pending = False
         self.target = None
         if self.out is not None:
@@ -1694,6 +1706,7 @@ class _LayerPlayer:
         """Tie the layer to ``seg``; a different clip starts without any picture."""
         if self.seg_id != seg.id:
             self.image = None
+            self.image_start = -1.0
             self.target = None
         self.seg_id = seg.id
         self.window = (seg.source_in, seg.source_out)
@@ -1827,10 +1840,15 @@ class _LayerPlayer:
             elif not start - tol <= self.target <= end + tol:
                 return                                       # not the frame that was asked for
             self.pending = False
+            if self.want_play is False and self.panel._layer_timer.isActive():
+                self.panel._layer_timer.stop()               # held-back seek: go now
+                QTimer.singleShot(0, self.panel._sync_layers)
+        if self.image is not None and abs(start - self.image_start) < _TS_EPS:
+            return                                           # already showing this very frame
         image = frame.toImage()
         if image.isNull():
             return
-        self.image = image
+        self.image, self.image_start = image, start
         self.panel._on_layer_frame(self)
 
 
@@ -2085,7 +2103,8 @@ class PreviewPanel(QWidget):
         vol = self._linear_volume()
         for slot in self._slots:
             if slot is self._active and self._mode == _MODE_MEDIA and self._seg is not None:
-                slot.set_audio(vol, self._muted or self._seg.muted or not self._playing)
+                slot.set_audio(vol, self._muted or self._seg.muted or not self._playing
+                               or self._doc.timeline.is_track_hidden(0))
             else:
                 slot.set_audio(vol, True)
         self._sync_audio()
@@ -2615,7 +2634,7 @@ class PreviewPanel(QWidget):
         picked = {s.id for s in doc.selected_segments() if s.is_overlay}
         if not picked:
             return None
-        for seg in reversed(doc.timeline.segments_at(self._t)):
+        for seg in reversed(doc.timeline.segments_at(self._t, visible_only=True)):
             if seg.id in picked:
                 return seg.id
         return None
@@ -2630,13 +2649,22 @@ class PreviewPanel(QWidget):
                 return None
         return None
 
+    def _seek_patience(self) -> int:
+        """How long a paused seek may stay unanswered before a newer one replaces it. Several
+        players decoding at once answer slower, and aborting every seek before its picture
+        arrives would freeze the preview while scrubbing."""
+        tl = self._doc.timeline
+        if tl.track_count > 1 and any(s.layer >= 1 for s in tl.segments_at(self._t, visible_only=True)):
+            return _SCRUB_PATIENCE_MS
+        return _SCRUB_COALESCE_MS
+
     def _refresh_overlays(self, *_args) -> None:
         """Hand the viewport the overlay clips under the playhead with their pictures."""
         if self._shut:
             return
         tl = self._doc.timeline
         items = []
-        for seg in tl.segments_at(self._t):
+        for seg in tl.segments_at(self._t, visible_only=True):
             if seg.layer < 1 or seg.is_audio:
                 continue
             lp = self._layers.get(seg.layer)
@@ -2661,7 +2689,8 @@ class PreviewPanel(QWidget):
         doc = self._doc
         tl = doc.timeline
         now = self._now()
-        active = {s.layer: s for s in tl.segments_at(self._t) if s.layer >= 1 and not s.is_audio}
+        active = {s.layer: s for s in tl.segments_at(self._t, visible_only=True)
+                  if s.layer >= 1 and not s.is_audio}
         for layer in list(self._layers):
             lp = self._layers[layer]
             if layer >= tl.track_count:
@@ -2708,8 +2737,9 @@ class PreviewPanel(QWidget):
                 same = (lp.target is not None and not lp.want_play
                         and _frame_index(lp.target, lp.fps) == _frame_index(pos, lp.fps))
                 if not same:
-                    if lp.pending and lp.loaded and now - lp.seek_wall < _SCRUB_COALESCE_MS:
-                        self._layer_timer.start(_SCRUB_COALESCE_MS)     # latest seek wins, later
+                    if lp.pending and lp.loaded and now - lp.seek_wall < self._seek_patience():
+                        # latest seek wins, later (or as soon as the picture of this one lands)
+                        self._layer_timer.start(max(1, self._seek_patience() - (now - lp.seek_wall)))
                     else:
                         lp.seek(pos, False, now)
             lp.set_audio(vol, not audible)
@@ -2926,10 +2956,11 @@ class PreviewPanel(QWidget):
             else:
                 self._settle_timer.start(_SETTLE_MS)
         elif (not self._playing and slot.loaded and slot.pending and not slot.want_play
-              and now - slot.issue_wall < _SCRUB_COALESCE_MS):
+              and now - slot.issue_wall < self._seek_patience()):
             slot.queued = (pos, seg.id)                # a seek is in flight: latest wins
-            self._scrub_timer.start(max(1, _SCRUB_COALESCE_MS - (now - slot.issue_wall)))
-            self._settle_timer.start(_SETTLE_MS + _SCRUB_COALESCE_MS)
+            patience = self._seek_patience()
+            self._scrub_timer.start(max(1, patience - (now - slot.issue_wall)))
+            self._settle_timer.start(_SETTLE_MS + patience)
         else:
             slot.seek(pos, play=self._playing, exact=not self._playing, seg_id=seg.id)
             if not self._playing:
@@ -3076,6 +3107,9 @@ class PreviewPanel(QWidget):
                 return
             if slot.exact and not slot.frame_has_target():
                 return                                    # not the frame that was asked for
+        if self._doc.timeline.is_track_hidden(0):
+            self._present_hidden(slot, seg, start)
+            return
         image = slot.frame.toImage()
         if image.isNull():
             return
@@ -3089,6 +3123,19 @@ class PreviewPanel(QWidget):
         else:
             self._settle_timer.stop()
         self.frameDisplayed.emit(image, t_frame)
+
+    def _present_hidden(self, slot: _Slot, seg: Segment, start: float) -> None:
+        """V1 is switched off: keep the clock and seek bookkeeping, show black instead."""
+        slot.shown = True
+        t_frame = seg.to_timeline(max(start, seg.source_in))
+        if self._viewport.state != _Viewport.BLACK or self._viewport.message:
+            self._viewport.show_black()
+        if self._playing:
+            now = self._now()
+            self._anchor_src, self._anchor_wall, self._frame_wall = max(start, seg.source_in), now, now
+            self._set_time(t_frame)
+        else:
+            self._settle_timer.stop()
 
     def _flush_queued(self) -> None:
         slot = self._active

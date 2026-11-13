@@ -47,7 +47,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, S
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath,
                            QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QScrollBar,
-                               QSizePolicy, QSlider, QToolButton, QVBoxLayout, QWidget)
+                               QSizePolicy, QSlider, QToolButton, QToolTip, QVBoxLayout, QWidget)
 
 from ..core.model import MAX_VIDEO_TRACKS, MediaSource, Segment, Timeline
 from ..core.timecode import format_timecode
@@ -86,7 +86,11 @@ RULER_MIN_MAJOR_PX = 96    # minimum distance between labelled ruler ticks
 RULER_MIN_MINOR_PX = 6
 PLAYHEAD_HANDLE_W = 11
 PLAYHEAD_HANDLE_H = 15
-GUTTER_W = 38              # lane label gutter (multi-track only)
+GUTTER_W = 66              # lane label gutter (multi-track only): label + eye + speaker
+GUTTER_ICON = 14           # size of the per-lane eye / speaker buttons
+GUTTER_EYE_X = 28          # left edge of the eye button
+GUTTER_MUTE_X = 47         # left edge of the speaker button
+HIDDEN_OPACITY = 0.34      # clips of a switched-off track are drawn this faint
 NEWTRACK_H = 18            # drop strip above the top lane (multi-track only)
 NEWTRACK_SLACK = 4         # px above the top lane that already count as "new track"
 LANE_STEP = 2 * LANE_PAD + 3   # clip bottom of one video lane -> clip top of the next
@@ -209,6 +213,7 @@ class TimelineView(QWidget):
         self._prev_count = len(document.timeline.all_segments())
         self._drag: Optional[_Drag] = None
         self._hover_id: Optional[str] = None
+        self._hover_button: Optional[tuple[str, int]] = None   # ("eye" | "mute", layer) under the pointer
         self._snap_time: Optional[float] = None
         self._last_playhead_x: Optional[int] = None
         self._offline: dict[str, bool] = {}
@@ -374,6 +379,54 @@ class TimelineView(QWidget):
 
     def lane_label(self, layer: int) -> str:
         return "A" if layer < 0 else f"V{layer + 1}"
+
+    def gutter_button_rect(self, kind: str, layer: int) -> QRect:
+        """Rectangle of the ``"eye"`` (show / hide) or ``"mute"`` (speaker) button of a video
+        lane, in widget coordinates."""
+        top = self.lane_top(layer)
+        x = GUTTER_EYE_X if kind == "eye" else GUTTER_MUTE_X
+        return QRect(x, top + (self._lane_h() - GUTTER_ICON) // 2, GUTTER_ICON, GUTTER_ICON)
+
+    def gutter_button_at(self, pos: QPoint) -> Optional[tuple[str, int]]:
+        """``(kind, layer)`` of the lane button under ``pos`` (``None`` elsewhere). The hit area
+        is a little larger than the icon."""
+        if self.gutter_width() == 0 or pos.y() < RULER_H or pos.x() >= self.gutter_width():
+            return None
+        for layer in range(self._n()):
+            for kind in ("eye", "mute"):
+                if self.gutter_button_rect(kind, layer).adjusted(-3, -4, 3, 4).contains(pos):
+                    return kind, layer
+        return None
+
+    def track_muted(self, layer: int) -> bool:
+        """True when the track has clips and all of them are muted."""
+        try:
+            clips = self._doc.timeline.track(layer)
+        except Exception:
+            return False
+        return bool(clips) and all(s.muted for s in clips)
+
+    def toggle_gutter_button(self, kind: str, layer: int) -> bool:
+        """Click on a lane button: show / hide the track, or mute / unmute all its clips."""
+        doc = self._doc
+        if layer < 0 or layer >= doc.timeline.track_count:
+            return False
+        if kind == "eye":
+            return doc.set_track_hidden(layer, not doc.timeline.is_track_hidden(layer))
+        ids = [s.id for s in doc.timeline.track(layer)]
+        if not ids:
+            return False
+        return doc.set_muted(ids, not self.track_muted(layer))
+
+    def _gutter_tip(self, button: tuple[str, int]) -> str:
+        kind, layer = button
+        name = self.lane_label(layer)
+        if kind == "eye":
+            return (f"Show {name}" if self._doc.timeline.is_track_hidden(layer)
+                    else f"Hide {name} (it is left out of the preview and the export)")
+        if not self._doc.timeline.track(layer):
+            return f"{name} has no clips to mute"
+        return f"Unmute all {name} clips" if self.track_muted(layer) else f"Mute all {name} clips"
 
     def _lane_geometry(self, seg: Segment) -> tuple[int, int, int, int, int]:
         """``(top, height, header, thumb_height, wave_height)`` for the lane of ``seg``."""
@@ -677,6 +730,10 @@ class TimelineView(QWidget):
         if pos.y() < RULER_H:
             self._start_scrub(pos, mods)
             return
+        button_hit = self.gutter_button_at(pos)
+        if button_hit is not None:
+            self.toggle_gutter_button(*button_hit)
+            return
         seg, zone = self.hit_test(pos)
         if seg is None:
             if pos.x() < self.gutter_width():
@@ -913,12 +970,26 @@ class TimelineView(QWidget):
 
     # -------------------------------------------------------------- key events
     def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            button = self.gutter_button_at(event.pos())
+            if button is not None:
+                QToolTip.showText(event.globalPos(), self._gutter_tip(button), self)
+            else:
+                QToolTip.hideText()
+                event.ignore()
+            return True
         # Claim Esc before window-level shortcuts see it, but only while dragging.
         if (event.type() == QEvent.Type.ShortcutOverride and self._drag is not None
                 and event.key() == Qt.Key.Key_Escape):
             event.accept()
             return True
         return super().event(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._hover_button is not None:
+            self._hover_button = None
+            self.update(QRect(0, RULER_H, self.gutter_width(), max(0, self.height() - RULER_H)))
+        super().leaveEvent(event)
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape and self._drag is not None:
@@ -1188,6 +1259,16 @@ class TimelineView(QWidget):
             self._drag_move()
 
     def _update_hover(self, pos: QPoint) -> None:
+        button = self.gutter_button_at(pos)
+        if button != self._hover_button:
+            self._hover_button = button
+            self.update(QRect(0, RULER_H, self.gutter_width(), max(0, self.height() - RULER_H)))
+        if button is not None:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            if self._hover_id is not None:
+                self._hover_id = None
+                self.update()
+            return
         seg, zone = self.hit_test(pos)
         hover = seg.id if seg is not None else None
         if hover != self._hover_id:
@@ -1254,6 +1335,7 @@ class TimelineView(QWidget):
                        Qt.AlignmentFlag.AlignCenter, HINT_TEXT)
         else:
             selection = set(doc.selection)
+            hidden = doc.timeline.track_hidden
             lifted = (drag.seg_id if drag is not None
                       and drag.kind in ("reorder", "slide", "move") else None)
             left, right = area.left() - 2, area.right() + 2
@@ -1264,8 +1346,14 @@ class TimelineView(QWidget):
                 x1 = self.time_to_x(seg.timeline_start)
                 if x1 > right:
                     continue
+                faint = not seg.is_audio and seg.layer in hidden
+                if faint:
+                    p.save()
+                    p.setOpacity(HIDDEN_OPACITY)
                 self._paint_clip(p, pal, seg, area, seg.id in selection,
                                  seg.id == self._hover_id and drag is None, seg.id == lifted)
+                if faint:
+                    p.restore()
             if lifted is not None:
                 if drag.kind == "slide":
                     self._paint_slide(p, pal, drag)
@@ -1304,16 +1392,39 @@ class TimelineView(QWidget):
         if audio is not None:
             lanes.append((-1, audio[0], audio[1]))
         selected_layers = {s.layer for s in self._doc.selected_segments() if not s.is_audio}
+        hidden = self._doc.timeline.track_hidden
         for layer, top, h in lanes:
             band = QRect(0, top - LANE_PAD, gw, h + 2 * LANE_PAD)
             p.fillRect(band, QColor(pal.track_bg))
             if layer in selected_layers:
                 p.fillRect(QRect(0, band.top(), 2, band.height()), QColor(pal.accent))
-            p.setPen(QColor(pal.text if layer in selected_layers else pal.text_dim))
-            p.drawText(QRect(0, top, gw - 1, h), Qt.AlignmentFlag.AlignCenter,
+            off = layer in hidden
+            p.setPen(QColor(pal.text_faint if off else pal.text if layer in selected_layers
+                            else pal.text_dim))
+            label_w = GUTTER_EYE_X - 4 if layer >= 0 else gw - 1
+            p.drawText(QRect(0, top, label_w, h), Qt.AlignmentFlag.AlignCenter,
                        self.lane_label(layer))
+            if layer >= 0:
+                self._paint_lane_buttons(p, pal, layer, off)
         p.fillRect(QRect(gw - 1, RULER_H, 1, self.height() - RULER_H), QColor(pal.border))
         p.restore()
+
+    def _paint_lane_buttons(self, p: QPainter, pal, layer: int, off: bool) -> None:
+        """Eye (show / hide) and speaker (mute all clips) buttons of one video lane."""
+        for kind in ("eye", "mute"):
+            rect = self.gutter_button_rect(kind, layer)
+            if self._hover_button == (kind, layer):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(_alpha(QColor(pal.text), 28))
+                p.drawRoundedRect(QRectF(rect.adjusted(-3, -3, 3, 3)), 4, 4)
+            if kind == "eye":
+                name, colour = ("eye-off", pal.warning) if off else ("eye", pal.text_dim)
+            else:
+                empty = not self._doc.timeline.track(layer)
+                muted = self.track_muted(layer)
+                name = "volume-x" if muted else "volume"
+                colour = pal.text_faint if (muted or empty or off) else pal.text_dim
+            p.drawPixmap(rect.topLeft(), icons.pixmap(name, colour, GUTTER_ICON))
 
     # ruler -----------------------------------------------------------------
     def _ruler_steps(self) -> tuple[float, int, int]:

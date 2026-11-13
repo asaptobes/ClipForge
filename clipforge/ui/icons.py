@@ -84,6 +84,8 @@ ICONS: dict[str, str] = {
     "cursor": '<path d="M5 3l14 7-6 2-2 6z"/>',
     "captions": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 10.5h3.5M13 10.5h4M7 14h5M14.5 14H17"/>',
     "eye": '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    "eye-off": '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>'
+               '<path d="M4 4l16 16"/>',
 }
 
 _cache: dict[tuple, QPixmap] = {}

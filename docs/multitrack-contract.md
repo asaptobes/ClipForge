@@ -251,3 +251,12 @@ close_gaps(track: int = 0) -> bool                                              
 
 Code that passes `timeline.all_segments()` to something expecting a single video lane must now
 group video clips by `Segment.layer` (or use `timeline.tracks`).
+
+## Track visibility (added in 1.3.1)
+
+- `Timeline.track_hidden: set[int]`, `is_track_hidden(i)`, `set_track_hidden(i, hidden)` (needs 2+ video tracks, else `EditError`); `segments_at(t, visible_only=False)`.
+- `TimelineSnapshot(segments, track_count, hidden=())`: `.hidden` takes part in equality, so hiding is undoable.
+- `Document.set_track_hidden(index, hidden) -> bool` (one undo step), `Document.is_track_hidden(index)`.
+- Project files: top-level `"hidden_tracks": [..]`; old files load fully visible.
+- Export: hidden tracks are excluded (`build_plan(..., hidden_layers=())`, `ExportJob(..., hidden_layers=())`). A hidden V1 gives a black base.
+- Preview: hidden overlay tracks are neither drawn nor heard; a hidden V1 stays the clock but renders black and silent.

@@ -27,7 +27,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Optional, Sequence
+from typing import Collection, Optional, Sequence
 
 from PySide6.QtCore import QObject, Signal
 
@@ -374,7 +374,8 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
                settings: ExportSettings, *, temp_dir: str,
                video_encoder: Optional[str] = None,
                captions: Sequence[CaptionLine] = (),
-               caption_style: Optional[CaptionStyle] = None) -> ExportPlan:
+               caption_style: Optional[CaptionStyle] = None,
+               hidden_layers: Collection[int] = ()) -> ExportPlan:
     """Turn timeline segments into FFmpeg commands.
 
     ``segments`` are in timeline order with their real ``timeline_start`` values
@@ -391,7 +392,15 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
     "pop" preset) when ``settings.captions`` is on; this forces accurate mode.
     ``segments`` may hold every lane (V1, overlay tracks ``layer >= 1``, detached audio):
     overlay clips are composited over V1 per the multi-track contract and force accurate mode.
+    ``hidden_layers`` lists switched-off video tracks (``Timeline.track_hidden``): their clips
+    are left out entirely (a hidden V1 gives a black base under the overlays), and the graph
+    is unchanged when nothing is hidden.
     Raises ``MediaError`` for an empty timeline or missing source files."""
+    hidden = set(hidden_layers)
+    if hidden:
+        segments = [s for s in segments if s.is_audio or s.layer not in hidden]
+        if not segments:
+            raise MediaError("There is nothing to export: every video track is hidden.")
     everything = _ordered(segments)
     segs = [s for s in everything if not s.is_audio and not s.is_overlay]
     asegs = [s for s in everything if s.is_audio]
@@ -910,8 +919,10 @@ class ExportJob(QObject):
                  settings: ExportSettings, *, temp_dir: str,
                  captions: Sequence[CaptionLine] = (),
                  caption_style: Optional[CaptionStyle] = None,
+                 hidden_layers: Collection[int] = (),
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
+        self._hidden_layers = sorted(set(hidden_layers))
         self._captions = [c.copy() for c in captions]
         self._caption_style = (CaptionStyle.from_dict(caption_style.to_dict())
                                if caption_style is not None else None)
@@ -957,7 +968,8 @@ class ExportJob(QObject):
             self._t0 = time.monotonic()
             plan = build_plan(self._sources, self._segments, self._settings,
                               temp_dir=self._temp_dir, captions=self._captions,
-                              caption_style=self._caption_style)
+                              caption_style=self._caption_style,
+                              hidden_layers=self._hidden_layers)
             self._track(plan)
             os.makedirs(os.path.dirname(plan.output_path) or ".", exist_ok=True)
             try:
@@ -974,7 +986,8 @@ class ExportJob(QObject):
                 plan = build_plan(self._sources, self._segments, self._settings,
                                   temp_dir=self._temp_dir,
                                   video_encoder=ffmpeg.cpu_encoder(self._settings.codec),
-                                  captions=self._captions, caption_style=self._caption_style)
+                                  captions=self._captions, caption_style=self._caption_style,
+                                  hidden_layers=self._hidden_layers)
                 self._track(plan)
                 self._execute(plan)
             self._cancel.raise_if_cancelled()

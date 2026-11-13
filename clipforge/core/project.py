@@ -73,6 +73,7 @@ class Project:
             "version": FORMAT_VERSION,
             "sources": sources,
             "video_tracks": self.timeline.track_count,
+            "hidden_tracks": sorted(self.timeline.track_hidden),
             "segments": [s.to_dict() for s in self.timeline.all_segments()],
             "playhead": self.playhead,
             "export": self.export.to_dict(),
@@ -135,7 +136,9 @@ class Project:
             segments = [Segment.from_dict(s) for s in data.get("segments", [])]
             segments = [s for s in segments if s.source_id in sources]
             tracks = min(max(1, int(data.get("video_tracks", 1))), MAX_VIDEO_TRACKS)
-            project = cls(sources=sources, timeline=Timeline(sources, segments, tracks),
+            raw_hidden = data.get("hidden_tracks", [])
+            hidden = [int(i) for i in raw_hidden] if isinstance(raw_hidden, list) else []
+            project = cls(sources=sources, timeline=Timeline(sources, segments, tracks, hidden),
                           export=ExportSettings.from_dict(data.get("export", {})),
                           playhead=float(data.get("playhead", 0.0)), path=path,
                           captions=lines_from_dicts(data.get("captions")),
@@ -146,7 +149,7 @@ class Project:
                 # same rule as for the live timeline: never keep clips of unknown media
                 entry.segments = TimelineSnapshot(
                     (s for s in entry.segments if s.source_id in sources),
-                    entry.segments.track_count)
+                    entry.segments.track_count, entry.segments.hidden)
             project.timeline.validate()
             # keep the playhead inside the timeline (NaN/negative/too large -> clamped)
             ph = project.playhead

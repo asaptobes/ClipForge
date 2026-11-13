@@ -15,7 +15,8 @@ from .model import MAX_VIDEO_TRACKS, Segment, TimelineSnapshot
 def _copy(snapshot: list[Segment]) -> TimelineSnapshot:
     """Deep copy that keeps the track count of a ``TimelineSnapshot`` (a plain list of
     clips gets as many tracks as its highest layer needs)."""
-    return TimelineSnapshot((s.copy() for s in snapshot), getattr(snapshot, "track_count", 1))
+    return TimelineSnapshot((s.copy() for s in snapshot), getattr(snapshot, "track_count", 1),
+                            getattr(snapshot, "hidden", ()))
 
 
 @dataclass
@@ -29,6 +30,7 @@ class HistoryEntry:
 
     def to_dict(self) -> dict:
         return {"label": self.label, "tracks": self.segments.track_count,
+                "hidden": list(self.segments.hidden),
                 "segments": [s.to_dict() for s in self.segments]}
 
     @classmethod
@@ -37,8 +39,13 @@ class HistoryEntry:
             tracks = min(max(1, int(d.get("tracks", 1))), MAX_VIDEO_TRACKS)
         except (TypeError, ValueError, OverflowError):
             tracks = 1
+        try:
+            hidden = [int(i) for i in d.get("hidden", [])]
+        except (TypeError, ValueError, OverflowError):
+            hidden = []
         return cls(d.get("label", "Edit"),
-                   TimelineSnapshot((Segment.from_dict(s) for s in d.get("segments", [])), tracks))
+                   TimelineSnapshot((Segment.from_dict(s) for s in d.get("segments", [])), tracks,
+                                    hidden))
 
 
 class History:
