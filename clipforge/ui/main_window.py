@@ -181,6 +181,12 @@ class MainWindow(QMainWindow):
         self.act_detach = a("Detach audio", d.detach_audio, ["Ctrl+Shift+D"], "detach-audio",
                             "Detach audio from the selected video clip onto the audio lane")
         tl.view.exportAudioRequested.connect(self.export_audio)
+        self.act_add_track = a("Add video track", tl.add_track, ["Ctrl+Shift+T"], "plus",
+                               "Add an empty video track above the others")
+        self.act_clip_up = a("Move clip to track above", lambda: tl.move_selected_track(1),
+                             ["Alt+Up"], None, "Move the selected clips to the track above")
+        self.act_clip_down = a("Move clip to track below", lambda: tl.move_selected_track(-1),
+                               ["Alt+Down"], None, "Move the selected clips to the track below")
         self.act_select_all = a("Select all clips", d.select_all, ["Ctrl+A"])
         self.act_deselect = a("Deselect", d.clear_selection, ["Ctrl+D"])
         self.act_play = a("Play / Pause", pv.toggle_play, ["Space"])

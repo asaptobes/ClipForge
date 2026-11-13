@@ -174,7 +174,7 @@ def _export_selftest(app, window, folder: str, log) -> None:
         doc.reorder(doc.timeline.segments[1].id, 0)
         settings = doc.export_settings
         settings.folder, settings.filename, settings.mode = folder, "selftest out", "accurate"
-        job = ExportJob(dict(doc.sources), [s.copy() for s in doc.timeline.segments], settings,
+        job = ExportJob(dict(doc.sources), [s.copy() for s in doc.timeline.all_segments()], settings,
                         temp_dir=str(window.settings.temp_path()))
         app._selftest_job = job
 

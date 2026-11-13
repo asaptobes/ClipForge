@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFrame, 
                                QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
                                QVBoxLayout, QWidget)
 
-from ..core.model import MediaSource
+from ..core.model import MAX_VIDEO_TRACKS, MediaSource
 from ..core import timecode as _timecode
 from ..core.timecode import format_duration, format_size
 from ..media import downloader as dl
@@ -188,6 +188,9 @@ def _quality_available(info: object, key: str) -> bool:
 
 
 # ------------------------------------------------------------------- delegate
+OVERLAY_SCALE = 0.5            # new overlay clips are half the canvas width
+
+
 class _MediaDelegate(QStyledItemDelegate):
     """Paints one library row: poster, title, meta line and an Offline flag."""
 
@@ -1127,6 +1130,75 @@ class LeftPanel(QWidget):
         self.document.append_to_timeline(source_id)
         self.statusMessage.emit(f"Added {media_title(src)} to the timeline")
 
+    def can_add_as_overlay(self, source_id: str) -> bool:
+        """Overlays sit on top of V1, so there has to be a base track clip first."""
+        return (source_id in self.document.sources and not self.is_offline(source_id)
+                and bool(self.document.timeline.segments))
+
+    def _overlay_track(self, source_id: str, at: float) -> int:
+        """Lowest overlay track with room for the source at ``at``; otherwise a new track
+        (or the top track when the project is at its track limit)."""
+        timeline = self.document.timeline
+        duration = self.document.sources[source_id].duration
+        for k in range(1, timeline.track_count):
+            if abs(timeline.fit_start(k, at, duration) - at) < 1e-6:
+                return k
+        return timeline.track_count if timeline.track_count < MAX_VIDEO_TRACKS             else timeline.track_count - 1
+
+    def _canvas_ratio(self) -> float:
+        """Width / height of the output canvas (best effort for aspect "source")."""
+        try:
+            w, h = (float(v) for v in str(self.document.aspect).split(":"))
+            if w > 0 and h > 0:
+                return w / h
+        except (ValueError, TypeError):
+            pass
+        base = self.document.timeline.segments
+        first = self.document.sources.get(base[0].source_id) if base else None
+        if first is not None and first.width > 0 and first.height > 0:
+            return first.width / first.height
+        return 16 / 9
+
+    def _overlay_scale(self, src: MediaSource) -> float:
+        """Half the canvas width, reduced for tall sources so the clip also stays within
+        half the canvas height."""
+        ratio = src.width / src.height if src.width > 0 and src.height > 0 else 16 / 9
+        return max(0.1, min(OVERLAY_SCALE, OVERLAY_SCALE * ratio / self._canvas_ratio()))
+
+    def _overlay_corner(self, src: MediaSource, scale: float) -> tuple[float, float]:
+        """Centre offset (fractions of canvas width / height) that puts a clip of the given
+        width fraction in the bottom-right corner with a small margin."""
+        margin = 0.04
+        canvas = self._canvas_ratio()
+        ratio = src.width / src.height if src.width > 0 and src.height > 0 else 16 / 9
+        height_frac = scale * canvas / ratio
+        return (max(0.0, 0.5 - scale / 2.0 - margin), max(0.0, 0.5 - height_frac / 2.0 - margin))
+
+    def add_as_overlay(self, source_id: str) -> bool:
+        """Put the source on an overlay track at the playhead, half size in the bottom-right
+        corner (a full-frame overlay would hide V1). Returns True when it was placed."""
+        src = self.document.sources.get(source_id)
+        if src is None:
+            return False
+        if not os.path.isfile(src.path):
+            self.refresh_offline()
+            self.statusMessage.emit("That media is offline. Relink it first.")
+            return False
+        doc = self.document
+        if not doc.timeline.segments:
+            self.statusMessage.emit("Add a clip to the main track first, then overlay on top of it.")
+            return False
+        at = doc.playhead
+        if not doc.place_on_timeline(source_id, self._overlay_track(source_id, at), at):
+            return False
+        placed = [s.id for s in doc.selected_segments() if s.is_overlay]
+        if placed:
+            scale = self._overlay_scale(src)
+            x, y = self._overlay_corner(src, scale)
+            doc.set_transform(placed, x=x, y=y, scale=scale)
+        self.statusMessage.emit(f"Added {media_title(src)} as an overlay")
+        return True
+
     def remove_source(self, source_id: str) -> None:
         self.document.remove_source(source_id)
 
@@ -1147,6 +1219,8 @@ class LeftPanel(QWidget):
         menu = QMenu(self)
         a_add = menu.addAction(icons.icon("plus"), "Add to timeline")
         a_add.setEnabled(not self.is_offline(sid))
+        a_overlay = menu.addAction(icons.icon("plus"), "Add as overlay")
+        a_overlay.setEnabled(self.can_add_as_overlay(sid))
         a_show = menu.addAction(icons.icon("folder"), "Show in folder")
         a_relink = menu.addAction(icons.icon("link"), "Relink…")
         menu.addSeparator()
@@ -1154,6 +1228,8 @@ class LeftPanel(QWidget):
         chosen = self._run_menu(menu, self.media_list.viewport().mapToGlobal(pos))
         if chosen is a_add:
             self.add_to_timeline(sid)
+        elif chosen is a_overlay:
+            self.add_as_overlay(sid)
         elif chosen is a_show:
             self.show_in_folder(sid)
         elif chosen is a_relink:

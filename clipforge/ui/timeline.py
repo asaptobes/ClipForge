@@ -1,4 +1,4 @@
-"""Timeline panel: tool row + custom-painted single-track timeline + scroll bar.
+"""Timeline panel: tool row + custom-painted multi-track timeline + scroll bars.
 
 Everything is read from and edited through :class:`clipforge.document.Document`;
 this module never touches the model directly.
@@ -22,6 +22,15 @@ Interaction rules (kept deliberately predictable)
 * **Wheel**: Ctrl+wheel zooms around the cursor, plain/Shift wheel and horizontal
   trackpad deltas scroll. Middle-button drag pans.
 * **Right-click** a clip: context menu (selects the clip first if needed).
+
+Multi-track
+-----------
+With more than one video track the lanes are drawn top to bottom as V<n> ... V1, then the
+audio lane, each with a label gutter on the left; the view scrolls vertically when they do
+not fit. Dragging a video clip moves it freely in time and between lanes
+(``Document.move_clip(id, start, track)``); a ghost shows where it will land, and dropping
+on the strip above the top lane creates a new track. A single-track project looks and
+behaves exactly as before (reorder drag, no gutter).
 """
 
 from __future__ import annotations
@@ -37,10 +46,10 @@ import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath,
                            QPen, QPixmap, QPolygonF)
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QScrollBar, QSizePolicy,
-                               QSlider, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMenu, QMessageBox, QScrollBar,
+                               QSizePolicy, QSlider, QToolButton, QVBoxLayout, QWidget)
 
-from ..core.model import MediaSource, Segment, Timeline
+from ..core.model import MAX_VIDEO_TRACKS, MediaSource, Segment, Timeline
 from ..core.timecode import format_timecode
 from ..document import Document
 from . import icons, theme
@@ -77,6 +86,12 @@ RULER_MIN_MAJOR_PX = 96    # minimum distance between labelled ruler ticks
 RULER_MIN_MINOR_PX = 6
 PLAYHEAD_HANDLE_W = 11
 PLAYHEAD_HANDLE_H = 15
+GUTTER_W = 38              # lane label gutter (multi-track only)
+NEWTRACK_H = 18            # drop strip above the top lane (multi-track only)
+NEWTRACK_SLACK = 4         # px above the top lane that already count as "new track"
+LANE_STEP = 2 * LANE_PAD + 3   # clip bottom of one video lane -> clip top of the next
+MIN_LANE_H = 36            # smallest video lane when several are stacked
+MAX_LANE_H = 110
 GHOST_MAX_W = 260
 AUTOSCROLL_MARGIN = 24     # px from the left/right border that auto-scrolls a drag
 AUTOSCROLL_MAX_STEP = 28
@@ -118,6 +133,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
+def clip_under_playhead(doc: Document) -> Optional[Segment]:
+    """The V1 clip under the playhead, else the top-most overlay clip under it."""
+    stack = doc.timeline.segments_at(doc.playhead)
+    if not stack:
+        return None
+    return stack[0] if stack[0].layer == 0 else stack[-1]
+
+
 def can_detach_audio(doc: Document) -> bool:
     """True when :meth:`Document.detach_audio` would do something right now: a selected
     video clip (or, with no video clip selected, the one under the playhead) has sound
@@ -125,7 +148,7 @@ def can_detach_audio(doc: Document) -> bool:
     timeline = doc.timeline
     targets = [s for s in doc.selected_segments() if not s.is_audio]
     if not targets:
-        under = timeline.segment_at(doc.playhead)
+        under = clip_under_playhead(doc)
         targets = [under] if under is not None else []
     for seg in targets:
         src = doc.sources.get(seg.source_id)
@@ -143,10 +166,10 @@ class _Drag:
 
     __slots__ = ("kind", "seg_id", "press", "offset", "grab_frac", "clip_w", "pos", "mods",
                  "start_scroll", "start_playhead", "drop_index", "collapse_on_release",
-                 "slide_start")
+                 "slide_start", "target_track")
 
     def __init__(self, kind: str, press: QPoint, seg_id: Optional[str] = None) -> None:
-        self.kind = kind                 # scrub | press | trim_l | trim_r | reorder | slide | pan
+        self.kind = kind                 # scrub | press | trim_l | trim_r | reorder | slide | move | pan
         self.seg_id = seg_id
         self.press = QPoint(press)
         self.pos = QPoint(press)
@@ -158,7 +181,8 @@ class _Drag:
         self.start_playhead = 0.0
         self.drop_index: Optional[int] = None
         self.collapse_on_release = False
-        self.slide_start: Optional[float] = None   # slide: clamped start of the dropped clip
+        self.slide_start: Optional[float] = None   # slide/move: start of the dropped clip
+        self.target_track = 0            # move: video track it will land on (== track_count: new)
 
 
 class TimelineView(QWidget):
@@ -177,6 +201,8 @@ class TimelineView(QWidget):
 
         self._pps = DEFAULT_PPS            # pixels per second
         self._scroll = 0.0                 # horizontal offset in pixels
+        self._vscroll = 0.0                # vertical offset of the lanes in pixels
+        self.confirm_remove = self._ask_remove   # (layer, clip_count) -> bool; tests may replace
         self._fitted = True                # zoom tracks "fit" until the user zooms
         self._snapping = True
         self._fps = 30.0
@@ -206,6 +232,7 @@ class TimelineView(QWidget):
         self._sync_min_height()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
+        document.tracksChanged.connect(self._on_tracks_changed)
         document.timelineChanged.connect(self._on_timeline_changed)
         document.selectionChanged.connect(self._on_selection_changed)
         document.sourcesChanged.connect(self._on_sources_changed)
@@ -226,14 +253,22 @@ class TimelineView(QWidget):
     def scroll_offset(self) -> float:
         return self._scroll
 
+    def gutter_width(self) -> int:
+        """Width of the lane-label gutter: only shown while there are several video tracks."""
+        return GUTTER_W if self._doc.timeline.track_count > 1 else 0
+
+    def _x0(self) -> float:
+        """Screen x of timeline time 0 at scroll offset 0."""
+        return LEFT_PAD + self.gutter_width()
+
     def time_to_x(self, t: float) -> float:
-        return LEFT_PAD + t * self._pps - self._scroll
+        return self._x0() + t * self._pps - self._scroll
 
     def x_to_time(self, x: float) -> float:
-        return (x - LEFT_PAD + self._scroll) / self._pps
+        return (x - self._x0() + self._scroll) / self._pps
 
     def content_width(self) -> float:
-        return LEFT_PAD + self._doc.duration * self._pps + RIGHT_PAD
+        return self._x0() + self._doc.duration * self._pps + RIGHT_PAD
 
     def max_scroll(self) -> float:
         return max(0.0, self.content_width() - self.width())
@@ -242,7 +277,7 @@ class TimelineView(QWidget):
         duration = self._doc.duration
         if duration <= 0:
             return DEFAULT_PPS
-        return max(50.0, self.width() - LEFT_PAD - RIGHT_PAD) / duration
+        return max(50.0, self.width() - self._x0() - RIGHT_PAD) / duration
 
     def max_pps(self) -> float:
         return MAX_FRAME_PX * self._fps
@@ -259,20 +294,86 @@ class TimelineView(QWidget):
     def _sync_min_height(self) -> None:
         self.setMinimumHeight(RULER_H + 2 * TRACK_PAD + MIN_CLIP_H + self._audio_extra())
 
-    def lanes(self) -> tuple[int, int, int, int]:
-        """``(clip_top, clip_height, thumb_height, wave_height)`` of the video lane."""
-        avail = self.height() - RULER_H - 2 * TRACK_PAD - self._audio_extra()
-        clip_h = int(_clamp(avail, MIN_CLIP_H, MAX_CLIP_H))
+    # ---- vertical layout -------------------------------------------------------
+    def _n(self) -> int:
+        return self._doc.timeline.track_count
+
+    def _top_pad(self) -> int:
+        return TRACK_PAD + (NEWTRACK_H if self._n() > 1 else 0)
+
+    def _lane_h(self) -> int:
+        """Clip height of one video lane."""
+        n = self._n()
+        avail = self.height() - RULER_H - self._top_pad() - TRACK_PAD - self._audio_extra()
+        if n <= 1:
+            return int(_clamp(avail, MIN_CLIP_H, MAX_CLIP_H))
+        return int(_clamp((avail - (n - 1) * LANE_STEP) / n, MIN_LANE_H, MAX_LANE_H))
+
+    def content_height(self) -> int:
+        n = self._n()
+        return (RULER_H + self._top_pad() + n * self._lane_h() + (n - 1) * LANE_STEP
+                + self._audio_extra() + TRACK_PAD)
+
+    def max_vscroll(self) -> float:
+        return max(0.0, self.content_height() - self.height())
+
+    def vscroll_offset(self) -> float:
+        return self._vscroll
+
+    def set_vscroll(self, offset: float) -> None:
+        offset = _clamp(offset, 0.0, self.max_vscroll())
+        if abs(offset - self._vscroll) < 1e-6:
+            return
+        self._vscroll = offset
+        self._view_changed()
+
+    def lane_top(self, layer: int) -> int:
+        """Screen y of the clips of video track ``layer`` (0 = V1, drawn lowest)."""
+        n = self._n()
+        return int(RULER_H + self._top_pad() + (n - 1 - layer) * (self._lane_h() + LANE_STEP)
+                   - self._vscroll)
+
+    def lanes(self, layer: int = 0) -> tuple[int, int, int, int]:
+        """``(clip_top, clip_height, thumb_height, wave_height)`` of a video lane (V1 default)."""
+        clip_h = self._lane_h()
         body = clip_h - HEADER_H
         wave_h = int(round(body * WAVE_FRACTION))
-        return RULER_H + TRACK_PAD, clip_h, body - wave_h, wave_h
+        return self.lane_top(layer), clip_h, body - wave_h, wave_h
 
     def audio_lane(self) -> Optional[tuple[int, int]]:
         """``(top, height)`` of the audio lane's clips, or ``None`` while it is hidden."""
         if not self.has_audio_lane():
             return None
-        y, h, _, _ = self.lanes()
+        y, h, _, _ = self.lanes(0)
         return y + h + AUDIO_GAP, AUDIO_H
+
+    def lane_at(self, y: float) -> Optional[int]:
+        """Video layer whose clip row contains screen ``y``; ``-1`` for the audio lane."""
+        if y < RULER_H:
+            return None
+        audio = self.audio_lane()
+        if audio is not None and audio[0] <= y < audio[0] + audio[1]:
+            return -1
+        h = self._lane_h()
+        for layer in range(self._n()):
+            top = self.lane_top(layer)
+            if top <= y < top + h:
+                return layer
+        return None
+
+    def target_layer(self, y: float) -> int:
+        """Video track a clip dropped with the pointer at ``y`` lands on. ``track_count``
+        means "a new track above the top one" (pointer above the top lane)."""
+        n = self._n()
+        if y < self.lane_top(n - 1) - NEWTRACK_SLACK and n < MAX_VIDEO_TRACKS:
+            return n
+        step = self._lane_h() + LANE_STEP
+        first = self.lane_top(n - 1)
+        row = int(math.floor((y - first + LANE_STEP / 2.0) / step))
+        return n - 1 - int(_clamp(row, 0, n - 1))
+
+    def lane_label(self, layer: int) -> str:
+        return "A" if layer < 0 else f"V{layer + 1}"
 
     def _lane_geometry(self, seg: Segment) -> tuple[int, int, int, int, int]:
         """``(top, height, header, thumb_height, wave_height)`` for the lane of ``seg``."""
@@ -280,7 +381,7 @@ class TimelineView(QWidget):
             lane = self.audio_lane()
             top = lane[0] if lane else 0
             return top, AUDIO_H, AUDIO_HEADER_H, 0, AUDIO_H - AUDIO_HEADER_H
-        y, h, thumb_h, wave_h = self.lanes()
+        y, h, thumb_h, wave_h = self.lanes(seg.layer)
         return y, h, HEADER_H, thumb_h, wave_h
 
     def clip_rect(self, seg: Segment) -> QRectF:
@@ -297,7 +398,7 @@ class TimelineView(QWidget):
             anchor_x = self._default_anchor()
         t = self.x_to_time(anchor_x)
         self._pps = _clamp(pps, self.min_pps(), self.max_pps())
-        self._scroll = _clamp(LEFT_PAD + t * self._pps - anchor_x, 0.0, self.max_scroll())
+        self._scroll = _clamp(self._x0() + t * self._pps - anchor_x, 0.0, self.max_scroll())
         self._fitted = False
         self._view_changed(cancel_thumbs=True)
 
@@ -315,7 +416,7 @@ class TimelineView(QWidget):
         margin = 0.08 * self.width()
         self._pps = _clamp((self.width() - 2 * margin) / span, self.min_pps(), self.max_pps())
         centre = (start + end) / 2.0
-        self._scroll = _clamp(LEFT_PAD + centre * self._pps - self.width() / 2.0,
+        self._scroll = _clamp(self._x0() + centre * self._pps - self.width() / 2.0,
                               0.0, self.max_scroll())
         self._fitted = False
         self._view_changed(cancel_thumbs=True)
@@ -352,7 +453,7 @@ class TimelineView(QWidget):
 
     def scroll_to_playhead(self) -> None:
         """Centre the playhead in the view."""
-        self.set_scroll(LEFT_PAD + self._doc.playhead * self._pps - self.width() / 2.0)
+        self.set_scroll(self._x0() + self._doc.playhead * self._pps - self.width() / 2.0)
 
     def set_snapping(self, enabled: bool) -> None:
         self._snapping = bool(enabled)
@@ -397,10 +498,20 @@ class TimelineView(QWidget):
                 fps = src.fps
         self._fps = fps if 1.0 <= fps <= 1000.0 else 30.0
 
+    def _on_tracks_changed(self) -> None:
+        """The number of video tracks changed: the gutter and lane heights follow."""
+        if self._fitted:
+            self._pps = self.min_pps()
+            self._scroll = 0.0
+        self._scroll = _clamp(self._scroll, 0.0, self.max_scroll())
+        self._vscroll = _clamp(self._vscroll, 0.0, self.max_vscroll())
+        self._view_changed()
+
     def _on_timeline_changed(self) -> None:
         segments = self._doc.timeline.all_segments()
         ids = {s.id for s in segments}
         self._sync_min_height()
+        self._vscroll = _clamp(self._vscroll, 0.0, self.max_vscroll())
         drag = self._drag
         if drag is not None and drag.seg_id is not None and drag.seg_id not in ids:
             self._abort_drag()
@@ -437,13 +548,14 @@ class TimelineView(QWidget):
         self._fitted = True
         self._pps = self.min_pps()
         self._scroll = 0.0
+        self._vscroll = 0.0
         self._view_changed(cancel_thumbs=True)
 
     def _on_playhead_changed(self, t: float) -> None:
         x = int(round(self.time_to_x(t)))
         if (self.follow_playhead and self._drag is None and not self._user_busy()
                 and (x < 0 or x > self.width() - 1) and self.width() > 0):
-            target = LEFT_PAD + t * self._pps - FOLLOW_ANCHOR * self.width()
+            target = self._x0() + t * self._pps - FOLLOW_ANCHOR * self.width()
             target = _clamp(target, 0.0, self.max_scroll())
             if abs(target - self._scroll) > 0.5:
                 self._scroll = target
@@ -474,10 +586,7 @@ class TimelineView(QWidget):
 
     def _on_thumbnail_ready(self, source_id: str, _time: float) -> None:
         if self._source_visible(source_id):
-            y, _, thumb_h, _ = self.lanes()
-            self.update(QRect(0, y + HEADER_H, self.width(), thumb_h))
-            if self.has_audio_lane():
-                self.update()
+            self.update()
 
     def _on_waveform_ready(self, source_id: str) -> None:
         if self._source_visible(source_id):
@@ -494,13 +603,11 @@ class TimelineView(QWidget):
 
     def hit_test(self, pos: QPoint) -> tuple[Optional[Segment], str]:
         """``(segment, zone)`` under ``pos``; zone is ``left``/``right``/``body`` or ``""``."""
-        y, h, _, _ = self.lanes()
-        lane = self._doc.timeline.segments
-        audio = self.audio_lane()
-        if audio is not None and audio[0] <= pos.y() < audio[0] + audio[1]:
-            lane = self._doc.timeline.audio
-        elif not (y <= pos.y() < y + h):
+        layer = self.lane_at(pos.y())
+        if layer is None or pos.x() < self.gutter_width():
             return None, ""
+        timeline = self._doc.timeline
+        lane = timeline.audio if layer < 0 else timeline.track(layer)
         x = pos.x()
         best: Optional[Segment] = None
         zone = ""
@@ -572,6 +679,8 @@ class TimelineView(QWidget):
             return
         seg, zone = self.hit_test(pos)
         if seg is None:
+            if pos.x() < self.gutter_width():
+                return                       # the label gutter is not a seek / clear area
             self._doc.clear_selection()
             self._start_scrub(pos, mods)
             return
@@ -619,7 +728,7 @@ class TimelineView(QWidget):
         pos = event.position().toPoint()
         drag.pos = QPoint(pos)
         drag.mods = event.modifiers()
-        if drag.kind in ("trim_l", "trim_r", "reorder", "slide"):
+        if drag.kind in ("trim_l", "trim_r", "reorder", "slide", "move"):
             self._drag_move()
             drag = self._drag            # the move may have aborted it
             if drag is None:
@@ -644,6 +753,11 @@ class TimelineView(QWidget):
             seg = self._segment_by_id(drag.seg_id)
             if seg is not None and drag.slide_start is not None:
                 doc.move_clip(seg.id, drag.slide_start)
+        elif drag.kind == "move":
+            seg = self._segment_by_id(drag.seg_id)
+            if seg is not None and drag.slide_start is not None:
+                target = _clamp(drag.target_track, 0, doc.track_count)
+                doc.move_clip(seg.id, drag.slide_start, int(target))
         elif drag.kind == "press":
             if drag.collapse_on_release and self._segment_by_id(drag.seg_id) is not None:
                 doc.select([drag.seg_id])
@@ -678,10 +792,15 @@ class TimelineView(QWidget):
             return
         if not pixel.isNull():
             delta = pixel.x() if abs(pixel.x()) > abs(pixel.y()) else pixel.y()
+            vertical = abs(pixel.y()) >= abs(pixel.x())
         else:
             raw = angle.x() if abs(angle.x()) > abs(angle.y()) else angle.y()
             delta = raw / 120.0 * 90.0
-        if delta:
+            vertical = abs(angle.y()) >= abs(angle.x())
+        if (vertical and self.max_vscroll() > 0
+                and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.set_vscroll(self._vscroll - delta)    # lanes taller than the view
+        elif delta:
             self.set_scroll(self._scroll - delta, user=True)
         event.accept()
 
@@ -690,6 +809,12 @@ class TimelineView(QWidget):
             return
         seg, _zone = self.hit_test(event.pos())
         if seg is None:
+            layer = self.lane_at(event.pos().y())
+            if self._n() > 1 and layer is not None and layer >= 0:
+                menu = self.build_track_menu(layer)
+                menu.exec(event.globalPos())
+                menu.deleteLater()
+                event.accept()
             return
         menu = self.build_context_menu(seg.id)
         menu.exec(event.globalPos())
@@ -718,12 +843,73 @@ class TimelineView(QWidget):
         delete.triggered.connect(lambda: doc.delete_selected(ripple=False))
         ripple = menu.addAction(icons.icon("ripple-delete"), "Ripple delete\tShift+Del")
         ripple.triggered.connect(lambda: doc.delete_selected(ripple=True))
+        if self._n() > 1 and any(not s.is_audio for s in segs):
+            menu.addSeparator()
+            up = menu.addAction("Move to track above\tAlt+Up")
+            up.triggered.connect(lambda: self.move_selected_track(1))
+            down = menu.addAction("Move to track below\tAlt+Down")
+            down.setEnabled(any(s.layer > 0 for s in segs if not s.is_audio))
+            down.triggered.connect(lambda: self.move_selected_track(-1))
         menu.addSeparator()
         all_muted = bool(segs) and all(s.muted for s in segs)
         mute = menu.addAction(icons.icon("volume" if all_muted else "volume-x"),
                               "Unmute" if all_muted else "Mute")
         mute.triggered.connect(lambda: doc.toggle_mute_selected())
         return menu
+
+    def build_track_menu(self, layer: int) -> QMenu:
+        """Context menu of a video lane: add / remove track."""
+        menu = QMenu(self)
+        add = menu.addAction(icons.icon("plus"), "Add track\tCtrl+Shift+T")
+        add.setEnabled(self._n() < MAX_VIDEO_TRACKS)
+        add.triggered.connect(lambda: self.add_track())
+        remove = menu.addAction(icons.icon("trash"), f"Remove track {self.lane_label(layer)}")
+        remove.setEnabled(layer >= 1)
+        remove.triggered.connect(lambda: self.remove_track(layer))
+        return menu
+
+    # ------------------------------------------------------------ track editing
+    def add_track(self) -> int:
+        """Add an empty video track on top. Returns its index, or -1 if refused."""
+        return self._doc.add_track()
+
+    def _ask_remove(self, layer: int, clips: int) -> bool:
+        noun = "clip" if clips == 1 else "clips"
+        box = QMessageBox(QMessageBox.Icon.Question, "Remove track",
+                          f"{self.lane_label(layer)} contains {clips} {noun}. "
+                          f"Remove the track and delete {'it' if clips == 1 else 'them'}?",
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def remove_track(self, layer: int) -> bool:
+        """Remove video track ``layer`` (never V1); asks first when it holds clips."""
+        timeline = self._doc.timeline
+        if not 1 <= layer < timeline.track_count:
+            return False
+        count = len(timeline.track(layer))
+        if count:
+            if not self.confirm_remove(layer, count):
+                return False
+            return self._doc.remove_track(layer, delete_clips=True)
+        return self._doc.remove_track(layer)
+
+    def move_selected_track(self, delta: int) -> bool:
+        """Move the selected video clips ``delta`` lanes (+1 = up) keeping their start time;
+        moving up from the top lane creates a new track. Returns True if anything moved."""
+        doc = self._doc
+        ids = [s.id for s in doc.selected_segments() if not s.is_audio]
+        moved = False
+        for sid in sorted(ids, key=lambda i: -(doc.timeline.get(i).layer) * delta):
+            try:
+                seg = doc.timeline.get(sid)
+            except Exception:
+                continue
+            target = seg.layer + delta
+            if target < 0:
+                continue
+            moved = doc.move_clip(sid, seg.timeline_start, target) or moved
+        return moved
 
     # -------------------------------------------------------------- key events
     def event(self, event) -> bool:
@@ -851,6 +1037,12 @@ class TimelineView(QWidget):
                     self.setCursor(Qt.CursorShape.ClosedHandCursor)
                     self._update_slide(drag)
                     return
+                if self._n() > 1:
+                    drag.kind = "move"
+                    drag.offset = seg.timeline_start - self.x_to_time(drag.press.x())
+                    self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                    self._update_move(drag)
+                    return
                 drag.kind = "reorder"
                 drag.clip_w = rect.width()
                 drag.grab_frac = _clamp((drag.press.x() - rect.left()) / max(rect.width(), 1.0),
@@ -858,9 +1050,50 @@ class TimelineView(QWidget):
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 self._update_reorder(drag)
         elif drag.kind == "reorder":
+            if self._n() < MAX_VIDEO_TRACKS and self.target_layer(drag.pos.y()) >= self._n():
+                seg = self._segment_by_id(drag.seg_id)
+                if seg is not None:           # dragged above the lane: make it an overlay move
+                    drag.kind = "move"
+                    drag.drop_index = None
+                    drag.offset = seg.timeline_start - self.x_to_time(drag.press.x())
+                    self._update_move(drag)
+                    return
             self._update_reorder(drag)
         elif drag.kind == "slide":
             self._update_slide(drag)
+        elif drag.kind == "move":
+            self._update_move(drag)
+
+    def _update_move(self, drag: _Drag) -> None:
+        """Work out where the dragged video clip would land: track from the pointer's
+        row, start from the snapped pointer time, then the nearest free slot there
+        (the same ``Timeline.fit_start`` the model uses on drop)."""
+        seg = self._segment_by_id(drag.seg_id)
+        if seg is None or seg.is_audio:
+            self._abort_drag()
+            return
+        timeline = self._doc.timeline
+        target = self.target_layer(drag.pos.y())
+        left = self.x_to_time(drag.pos.x()) + drag.offset
+        points = timeline.snap_points(exclude=[seg.id]) + [self._doc.playhead]
+        start, snapped = self._snap(left, points, drag.mods)
+        if not snapped:
+            end, snapped_end = self._snap(left + seg.duration, points, drag.mods)
+            if snapped_end:
+                start, snapped = end - seg.duration, True
+        start = max(0.0, start)
+        if target < timeline.track_count:
+            landed = timeline.fit_start(target, start, seg.duration, exclude=[seg.id])
+        else:
+            landed = start
+        drag.target_track = target
+        drag.slide_start = landed
+        snap_at = None
+        if snapped and abs(landed - start) < 1e-6:
+            snap_at = next((t for t in (landed, landed + seg.duration)
+                            if any(abs(p - t) < 1e-6 for p in points)), None)
+        self._set_snap_time(snap_at)
+        self.update()
 
     def _update_slide(self, drag: _Drag) -> None:
         """Work out where the dragged audio clip would land (snapped, then clamped
@@ -923,7 +1156,7 @@ class TimelineView(QWidget):
 
     def _autoscroll_tick(self) -> None:
         drag = self._drag
-        if drag is None or drag.kind == "pan":
+        if drag is None or drag.kind == "pan" or drag.kind == "press":
             return
         x, w = drag.pos.x(), self.width()
         if x < AUTOSCROLL_MARGIN:
@@ -931,15 +1164,28 @@ class TimelineView(QWidget):
         elif x > w - AUTOSCROLL_MARGIN:
             step = min(AUTOSCROLL_MAX_STEP, (x - (w - AUTOSCROLL_MARGIN)) * 0.6 + 2)
         else:
-            return
-        if drag.kind == "press":
-            return
-        target = _clamp(self._scroll + step, 0.0, self.max_scroll())
-        if abs(target - self._scroll) < 0.5:
-            return
-        self._scroll = target
-        self._view_changed(cancel_thumbs=True)
-        self._drag_move()
+            step = 0.0
+        vstep = 0.0
+        if drag.kind == "move" and self.max_vscroll() > 0:
+            y, h = drag.pos.y(), self.height()
+            if y > h - AUTOSCROLL_MARGIN:
+                vstep = min(AUTOSCROLL_MAX_STEP, (y - (h - AUTOSCROLL_MARGIN)) * 0.6 + 2)
+            elif y < RULER_H + AUTOSCROLL_MARGIN:
+                vstep = -min(AUTOSCROLL_MAX_STEP, (RULER_H + AUTOSCROLL_MARGIN - y) * 0.6 + 2)
+        changed = False
+        if step:
+            target = _clamp(self._scroll + step, 0.0, self.max_scroll())
+            if abs(target - self._scroll) >= 0.5:
+                self._scroll = target
+                changed = True
+        if vstep:
+            target = _clamp(self._vscroll + vstep, 0.0, self.max_vscroll())
+            if abs(target - self._vscroll) >= 0.5:
+                self._vscroll = target
+                changed = True
+        if changed:
+            self._view_changed(cancel_thumbs=True)
+            self._drag_move()
 
     def _update_hover(self, pos: QPoint) -> None:
         seg, zone = self.hit_test(pos)
@@ -955,6 +1201,7 @@ class TimelineView(QWidget):
     # ----------------------------------------------------------------- resizing
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._vscroll = _clamp(self._vscroll, 0.0, self.max_vscroll())
         if self._fitted:
             self._pps = self.min_pps()
             self._scroll = 0.0
@@ -982,14 +1229,18 @@ class TimelineView(QWidget):
         width, height = self.width(), self.height()
         p = QPainter(self)
         p.fillRect(area, QColor(pal.panel_alt))
-        clip_y, clip_h, thumb_h, wave_h = self.lanes()
-        p.fillRect(QRect(area.left(), clip_y - LANE_PAD, area.width(), clip_h + 2 * LANE_PAD),
-                   QColor(pal.track_bg))
+        p.save()
+        p.setClipRect(QRect(0, RULER_H, width, max(0, height - RULER_H)))
+        n = self._n()
+        clip_h = self._lane_h()
+        for layer in range(n):
+            top = self.lane_top(layer)
+            p.fillRect(QRect(area.left(), top - LANE_PAD, area.width(), clip_h + 2 * LANE_PAD),
+                       QColor(pal.track_bg))
         audio_lane = self.audio_lane()
         if audio_lane is not None:
             p.fillRect(QRect(area.left(), audio_lane[0] - LANE_PAD, area.width(),
                              audio_lane[1] + 2 * LANE_PAD), QColor(pal.track_bg))
-        self._paint_ruler(p, pal, area)
 
         doc = self._doc
         segments = doc.timeline.all_segments()
@@ -1003,8 +1254,8 @@ class TimelineView(QWidget):
                        Qt.AlignmentFlag.AlignCenter, HINT_TEXT)
         else:
             selection = set(doc.selection)
-            lifted = (drag.seg_id if drag is not None and drag.kind in ("reorder", "slide")
-                      else None)
+            lifted = (drag.seg_id if drag is not None
+                      and drag.kind in ("reorder", "slide", "move") else None)
             left, right = area.left() - 2, area.right() + 2
             for seg in segments:
                 x2 = self.time_to_x(seg.timeline_end)
@@ -1018,9 +1269,15 @@ class TimelineView(QWidget):
             if lifted is not None:
                 if drag.kind == "slide":
                     self._paint_slide(p, pal, drag)
+                elif drag.kind == "move":
+                    self._paint_move(p, pal, drag)
                 else:
                     self._paint_reorder(p, pal, drag)
+        p.restore()
 
+        if n > 1:
+            self._paint_gutter(p, pal, area)
+        self._paint_ruler(p, pal, area)
         if self._snap_time is not None:
             sx = int(round(self.time_to_x(self._snap_time)))
             snap = QColor(pal.snap_line)
@@ -1028,6 +1285,35 @@ class TimelineView(QWidget):
             p.fillRect(QRect(sx, 0, 1, height), snap)
         self._paint_playhead(p, pal)
         p.end()
+
+    def _paint_gutter(self, p: QPainter, pal, area: QRect) -> None:
+        """Opaque label column: V<n> ... V1 and the audio lane."""
+        gw = self.gutter_width()
+        if area.left() >= gw:
+            return
+        p.save()
+        p.setClipRect(QRect(0, RULER_H, gw, max(0, self.height() - RULER_H)))
+        p.fillRect(QRect(0, RULER_H, gw, self.height() - RULER_H), QColor(pal.panel_alt))
+        clip_h = self._lane_h()
+        font = QFont(self.font())
+        font.setPixelSize(11)
+        font.setBold(True)
+        p.setFont(font)
+        lanes = [(layer, self.lane_top(layer), clip_h) for layer in range(self._n())]
+        audio = self.audio_lane()
+        if audio is not None:
+            lanes.append((-1, audio[0], audio[1]))
+        selected_layers = {s.layer for s in self._doc.selected_segments() if not s.is_audio}
+        for layer, top, h in lanes:
+            band = QRect(0, top - LANE_PAD, gw, h + 2 * LANE_PAD)
+            p.fillRect(band, QColor(pal.track_bg))
+            if layer in selected_layers:
+                p.fillRect(QRect(0, band.top(), 2, band.height()), QColor(pal.accent))
+            p.setPen(QColor(pal.text if layer in selected_layers else pal.text_dim))
+            p.drawText(QRect(0, top, gw - 1, h), Qt.AlignmentFlag.AlignCenter,
+                       self.lane_label(layer))
+        p.fillRect(QRect(gw - 1, RULER_H, 1, self.height() - RULER_H), QColor(pal.border))
+        p.restore()
 
     # ruler -----------------------------------------------------------------
     def _ruler_steps(self) -> tuple[float, int, int]:
@@ -1107,6 +1393,10 @@ class TimelineView(QWidget):
             wave_colour = QColor(pal.waveform)
             body = _mix(body, wave_colour, 0.16)
             header = _mix(header, wave_colour, 0.34)
+        elif seg.is_overlay:                      # overlay tracks: accent tint
+            accent = QColor(pal.accent)
+            body = _mix(body, accent, 0.20)
+            header = _mix(header, accent, 0.46)
         danger = QColor(pal.danger)
         if offline:
             body = _mix(body, danger, 0.38)
@@ -1301,7 +1591,7 @@ class TimelineView(QWidget):
             return
         total = len(peaks)
         # Source time at every visible pixel-column edge -> peak row index.
-        edges = (np.arange(va, vb + 1, dtype=np.float64) - LEFT_PAD + self._scroll) / self._pps
+        edges = (np.arange(va, vb + 1, dtype=np.float64) - self._x0() + self._scroll) / self._pps
         rows = np.floor((seg.source_in + edges - seg.timeline_start) * PEAKS_PER_SECOND)
         rows = np.clip(rows, 0, total).astype(np.int64)
         lo = int(rows[0])
@@ -1391,6 +1681,60 @@ class TimelineView(QWidget):
         p.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), radius, radius)
         p.restore()
 
+    def _paint_move(self, p: QPainter, pal, drag: _Drag) -> None:
+        """Ghost of where the dragged video clip will land, and the new-track drop marker."""
+        seg = self._segment_by_id(drag.seg_id)
+        if seg is None or drag.slide_start is None:
+            return
+        n = self._n()
+        target = drag.target_track
+        new_track = target >= n
+        clip_h = self._lane_h()
+        accent = QColor(pal.accent)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if new_track:
+            top_lane = self.lane_top(n - 1)
+            strip = QRectF(self.gutter_width() + 2, RULER_H + 3,
+                           self.width() - self.gutter_width() - 4,
+                           top_lane - LANE_PAD - RULER_H - 5)
+            if strip.height() >= 10:
+                pen = QPen(accent, 1, Qt.PenStyle.CustomDashLine)
+                pen.setDashPattern([4, 3])
+                p.setPen(pen)
+                p.setBrush(_alpha(accent, 40))
+                p.drawRoundedRect(strip, 4, 4)
+                font = QFont(self.font())
+                font.setPixelSize(11)
+                p.setFont(font)
+                p.setPen(accent)
+                p.drawText(strip, Qt.AlignmentFlag.AlignCenter,
+                           f"Drop to create track {self.lane_label(n)}")
+            else:
+                p.fillRect(QRectF(0, top_lane - LANE_PAD - 1, self.width(), 2), accent)
+            y = top_lane
+        else:
+            y = self.lane_top(target)
+        x1 = round(self.time_to_x(drag.slide_start))
+        x2 = max(x1 + 1, round(self.time_to_x(drag.slide_start + seg.duration)) - CLIP_GAP)
+        rect = QRectF(x1, y, x2 - x1, clip_h)
+        radius = min(CLIP_RADIUS, rect.width() / 2.0)
+        p.setPen(QPen(QColor(pal.clip_selected), 1.5))
+        p.setBrush(_alpha(accent, 70))
+        p.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), radius, radius)
+        source = self._doc.sources.get(seg.source_id)
+        if source is not None and rect.width() > 40:
+            font = QFont(self.font())
+            font.setPixelSize(11)
+            p.setFont(font)
+            title = source.title or os.path.splitext(os.path.basename(source.path))[0]
+            p.setPen(QColor(pal.text))
+            p.drawText(QRectF(rect.left() + 8, rect.top(), rect.width() - 16, HEADER_H),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                       QFontMetrics(font).elidedText(title, Qt.TextElideMode.ElideRight,
+                                                     int(rect.width() - 16)))
+        p.restore()
+
     def _paint_playhead(self, p: QPainter, pal) -> None:
         x = int(round(self.time_to_x(self._doc.playhead)))
         self._last_playhead_x = x
@@ -1399,7 +1743,8 @@ class TimelineView(QWidget):
             return
         colour = QColor(pal.playhead)
         top = RULER_H - PLAYHEAD_HANDLE_H - 1
-        p.fillRect(QRect(x, top + 4, 1, self.height() - top - 4), colour)
+        line_bottom = self.height() if x >= self.gutter_width() else RULER_H
+        p.fillRect(QRect(x, top + 4, 1, line_bottom - top - 4), colour)
         cx = x + 0.5
         p.save()
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -1450,7 +1795,11 @@ class TimelinePanel(QWidget):
                                         lambda: document.detach_audio())
         self.mute_button = self._tool("volume", "Mute clip",
                                       lambda: document.toggle_mute_selected())
-        self.gaps_button = self._tool("close-gaps", "Close gaps", lambda: document.close_gaps())
+        self.gaps_button = self._tool("close-gaps", "Close gaps",
+                                      lambda: document.close_gaps(self._gap_track()))
+        self.track_button = self._tool("plus", "Add video track (Ctrl+Shift+T)", self.add_track)
+        self.track_button.setText("Track")
+        self.track_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.snap_button = self._tool("magnet", "Snapping (hold Alt while dragging to bypass)")
         self.snap_button.setCheckable(True)
         self.snap_button.setChecked(True)
@@ -1484,7 +1833,8 @@ class TimelinePanel(QWidget):
         row.setSpacing(2)
         for widget in (self.undo_button, self.redo_button, self._separator(),
                        self.split_button, self.delete_button, self.ripple_button,
-                       self.detach_button, self.mute_button, self.gaps_button, self._separator(), self.snap_button):
+                       self.detach_button, self.mute_button, self.gaps_button, self._separator(),
+                       self.track_button, self.snap_button):
             row.addWidget(widget)
         row.addSpacing(10)
         row.addWidget(self.info_label, 1)
@@ -1507,8 +1857,18 @@ class TimelinePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        self.vscrollbar = QScrollBar(Qt.Orientation.Vertical, self)
+        self.vscrollbar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.vscrollbar.valueChanged.connect(self._on_vscrollbar_changed)
+        self.vscrollbar.setVisible(False)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.view, 1)
+        body.addWidget(self.vscrollbar)
+
         layout.addLayout(row)
-        layout.addWidget(self.view, 1)
+        layout.addLayout(body, 1)
         layout.addWidget(self.scrollbar)
 
         self.view.viewChanged.connect(self._sync_view_controls)
@@ -1516,6 +1876,7 @@ class TimelinePanel(QWidget):
         document.selectionChanged.connect(self._update_actions)
         document.timelineChanged.connect(self._update_actions)
         document.projectReset.connect(self._update_actions)
+        document.tracksChanged.connect(self._update_actions)
         document.playheadChanged.connect(self._update_split)
         document.sourcesChanged.connect(self._update_split)
         self.refresh_theme()
@@ -1548,6 +1909,14 @@ class TimelinePanel(QWidget):
 
     def scroll_to_playhead(self) -> None:
         self.view.scroll_to_playhead()
+
+    def add_track(self) -> int:
+        """Add an empty video track on top. Returns its index, or -1 if refused."""
+        return self.view.add_track()
+
+    def move_selected_track(self, delta: int) -> bool:
+        """Move the selected video clips one lane up (``+1``) or down (``-1``)."""
+        return self.view.move_selected_track(delta)
 
     def refresh_media_status(self) -> None:
         """Re-check which source files exist (the result is cached between calls)."""
@@ -1596,6 +1965,16 @@ class TimelinePanel(QWidget):
         if not self._syncing:
             self.view.set_scroll(float(value))
 
+    def _on_vscrollbar_changed(self, value: int) -> None:
+        if not self._syncing:
+            self.view.set_vscroll(float(value))
+
+    def _gap_track(self) -> int:
+        """Track whose gaps the button closes: the lane of the selected video clips when
+        they share one, otherwise V1."""
+        layers = {s.layer for s in self.document.selected_segments() if not s.is_audio}
+        return layers.pop() if len(layers) == 1 else 0
+
     def _sync_view_controls(self) -> None:
         view = self.view
         self._syncing = True
@@ -1607,6 +1986,12 @@ class TimelinePanel(QWidget):
             self.scrollbar.setSingleStep(40)
             self.scrollbar.setValue(value)
             self.zoom_slider.setValue(int(round(view.zoom_fraction() * ZOOM_SLIDER_STEPS)))
+            vmax = int(math.ceil(view.max_vscroll()))
+            self.vscrollbar.setRange(0, vmax)
+            self.vscrollbar.setPageStep(max(1, view.height()))
+            self.vscrollbar.setSingleStep(24)
+            self.vscrollbar.setValue(int(round(view.vscroll_offset())))
+            self.vscrollbar.setVisible(vmax > 0)
         finally:
             self._syncing = False
         has_clips = not self.document.timeline.is_empty()
@@ -1620,7 +2005,7 @@ class TimelinePanel(QWidget):
     def _update_split(self, *_args) -> None:
         doc = self.document
         t = doc.playhead
-        self.split_button.setEnabled(doc.timeline.segment_at(t) is not None
+        self.split_button.setEnabled(clip_under_playhead(doc) is not None
                                      or any(s.contains(t) for s in doc.selected_segments()))
         self.detach_button.setEnabled(can_detach_audio(doc))
 
@@ -1645,7 +2030,8 @@ class TimelinePanel(QWidget):
             self._mute_icon_name = icon_name
             self.mute_button.setIcon(icons.icon(icon_name))
         self.mute_button.setToolTip("Unmute clip" if all_muted else "Mute clip")
-        self.gaps_button.setEnabled(bool(doc.timeline.gaps()))
+        self.gaps_button.setEnabled(bool(doc.timeline.gaps(self._gap_track())))
+        self.track_button.setEnabled(doc.track_count < MAX_VIDEO_TRACKS)
         self._update_split()
         self._update_info(segs)
         self._sync_view_controls()

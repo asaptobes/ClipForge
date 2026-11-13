@@ -34,7 +34,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideo
 from PySide6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QLabel, QSizePolicy,
                                QSlider, QToolButton, QToolTip, QVBoxLayout, QWidget)
 
-from ..core.model import MediaSource, Segment
+from ..core.model import POS_LIMIT, SCALE_MAX, SCALE_MIN, MediaSource, Segment
 from ..core.timecode import format_timecode
 from . import icons, theme
 
@@ -114,6 +114,75 @@ def crop_rect(src_w: float, src_h: float, ratio: float, crop_x: float) -> QRectF
 def pan_crop_x(seg: Segment, source_time: float) -> float:
     """Crop position of ``seg`` at a source time (static, or linearly interpolated pan)."""
     return seg.crop_x_at(source_time)
+
+
+# ------------------------------------------------------- overlay geometry (pure)
+HANDLE_SIZE = 9.0           # painted corner handle (px)
+HANDLE_HIT = 8.0            # half-size of the corner hit area (px)
+CORNERS = ("tl", "tr", "bl", "br")
+
+
+def overlay_rect(canvas: QRectF, aspect: float, pos_x: float, pos_y: float,
+                 scale: float) -> QRectF:
+    """Where an overlay clip lands on ``canvas`` (same geometry as the export): width is
+    ``scale`` x canvas width, the height follows the source ``aspect`` (w/h) and the centre
+    sits at ``(0.5 + pos_x, 0.5 + pos_y)`` of the canvas."""
+    aspect = aspect if aspect and aspect > 0 else 16 / 9
+    w = scale * canvas.width()
+    h = w / aspect
+    cx = canvas.x() + canvas.width() * (0.5 + pos_x)
+    cy = canvas.y() + canvas.height() * (0.5 + pos_y)
+    return QRectF(cx - w / 2, cy - h / 2, w, h)
+
+
+def corner_point(rect: QRectF, corner: str) -> QPointF:
+    return QPointF(rect.left() if corner in ("tl", "bl") else rect.right(),
+                   rect.top() if corner in ("tl", "tr") else rect.bottom())
+
+
+def hit_test_overlay(rect: QRectF, pos: QPointF, tol: float = HANDLE_HIT) -> Optional[str]:
+    """``"tl" | "tr" | "bl" | "br"`` for a corner handle, ``"body"`` inside the frame,
+    ``None`` elsewhere. Corners win over the body."""
+    best, best_d = None, None
+    for c in CORNERS:
+        p = corner_point(rect, c)
+        dx, dy = abs(pos.x() - p.x()), abs(pos.y() - p.y())
+        if dx <= tol and dy <= tol:
+            d = dx * dx + dy * dy
+            if best_d is None or d < best_d:
+                best, best_d = c, d
+    if best is not None:
+        return best
+    return "body" if rect.contains(pos) else None
+
+
+def moved_position(base_x: float, base_y: float, dx_px: float, dy_px: float,
+                   canvas: QRectF) -> tuple[float, float]:
+    """New ``(pos_x, pos_y)`` after dragging the body by a pixel delta (clamped)."""
+    if canvas.width() <= 0 or canvas.height() <= 0:
+        return base_x, base_y
+    x = base_x + dx_px / canvas.width()
+    y = base_y + dy_px / canvas.height()
+    return (min(max(x, -POS_LIMIT), POS_LIMIT), min(max(y, -POS_LIMIT), POS_LIMIT))
+
+
+def resized_scale(base_scale: float, rect: QRectF, corner: str, pos: QPointF) -> float:
+    """New scale after dragging ``corner`` of ``rect`` to ``pos``. The centre and aspect stay;
+    the scale follows the cursor's distance from the centre (clamped to the model limits)."""
+    c = rect.center()
+    p0 = corner_point(rect, corner)
+    d0 = math.hypot(p0.x() - c.x(), p0.y() - c.y())
+    if d0 < 1e-6:
+        return base_scale
+    d1 = math.hypot(pos.x() - c.x(), pos.y() - c.y())
+    return min(max(base_scale * d1 / d0, SCALE_MIN), SCALE_MAX)
+
+
+def source_aspect(src: Optional[MediaSource]) -> float:
+    """Display aspect (w/h) of a source, 16:9 when unknown."""
+    if src is not None and src.width > 0 and src.height > 0:
+        return src.width / src.height
+    return 16 / 9
 
 
 class _BlurCache:
@@ -489,9 +558,18 @@ class _Viewport(QWidget):
     #: a reframe edit was finished: (``"start"`` | ``"end"``, crop position 0..1)
     cropCommitted = Signal(str, float)
     modeRequested = Signal(str)          # "static" | "pan" (from the pill)
+    #: overlay handle drag: began / live (clip id, pos_x, pos_y, scale) / finished / aborted
+    transformBegan = Signal()
+    transformChanged = Signal(str, float, float, float)
+    transformEnded = Signal()
+    transformCancelled = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self._overlays: list[tuple[Segment, Optional[QImage], float]] = []
+        self._selected_overlay: Optional[str] = None
+        self._ratio_hint: Optional[float] = None
+        self._tdrag: Optional[dict] = None
         self._image: Optional[QImage] = None
         self._state = self.PLACEHOLDER
         self._message = ""
@@ -565,6 +643,7 @@ class _Viewport(QWidget):
     def set_canvas(self, aspect: str, mode: str) -> None:
         if (aspect, mode) != (self._aspect, self._mode):
             self.cancel_drag()
+            self.cancel_transform()
             self._aspect, self._mode = aspect, mode
         self._update_handle_ui()
         self.update()
@@ -604,6 +683,139 @@ class _Viewport(QWidget):
         seg = self._seg
         return pan_crop_x(seg, self._src_t) if seg is not None else 0.5
 
+    # overlays ------------------------------------------------------------------
+    def set_overlays(self, items: list[tuple[Segment, Optional[QImage], float]],
+                     selected: Optional[str] = None, ratio_hint: Optional[float] = None) -> None:
+        """Overlay clips to composite, bottom-to-top: ``(clip copy, picture or None, aspect)``.
+        ``selected`` is the overlay that carries the transform handles."""
+        self._overlays = list(items)
+        ids = {seg.id for seg, _img, _a in self._overlays}
+        self._selected_overlay = selected if selected in ids else None
+        self._ratio_hint = ratio_hint
+        if self._tdrag is not None and self._tdrag["id"] not in ids:
+            self.cancel_transform()
+        self.update()
+
+    def overlays(self) -> list[tuple[Segment, Optional[QImage], float]]:
+        return list(self._overlays)
+
+    def compose_rect(self) -> Optional[QRectF]:
+        """The rectangle overlays are composited on: the canvas, or with the source aspect
+        the picture's own letterboxed rectangle (black base of the right shape in a gap)."""
+        canvas = self.canvas_rect()
+        if canvas is not None or not self._overlays or self._state == self.PLACEHOLDER:
+            return canvas
+        if self._state == self.FRAME and self._image is not None and not self._image.isNull():
+            return self.video_rect()
+        ratio = self._ratio_hint or self._overlays[0][2]
+        area = QRectF(self.rect()).adjusted(_CANVAS_MARGIN, _CANVAS_MARGIN,
+                                            -_CANVAS_MARGIN, -_CANVAS_MARGIN)
+        r = fit_rect(area, ratio)
+        if r.width() < 4 or r.height() < 4:
+            return None
+        return QRectF(round(r.x()), round(r.y()), max(1.0, round(r.width())),
+                      max(1.0, round(r.height())))
+
+    def overlay_frame(self, overlay_id: Optional[str] = None) -> Optional[QRectF]:
+        """Widget-space rectangle of an overlay (default: the selected one)."""
+        want = overlay_id or self._selected_overlay
+        comp = self.compose_rect()
+        if want is None or comp is None:
+            return None
+        for seg, _img, aspect in self._overlays:
+            if seg.id == want:
+                return overlay_rect(comp, aspect, seg.pos_x, seg.pos_y, seg.scale)
+        return None
+
+    def transform_active(self) -> bool:
+        return (self._interactive and self._selected_overlay is not None
+                and self.overlay_frame() is not None)
+
+    def is_transforming(self) -> bool:
+        return self._tdrag is not None
+
+    def cancel_transform(self) -> None:
+        """Abort an overlay drag (the panel restores the model)."""
+        if self._tdrag is None:
+            return
+        self._tdrag = None
+        self.releaseKeyboard()
+        self.unsetCursor()
+        self.transformCancelled.emit()
+        self.update()
+
+    def _overlay_cursor(self, pos: Optional[QPointF]) -> bool:
+        """Set the cursor for the overlay handles; False when the pointer is not on them."""
+        if not self.transform_active():
+            return False
+        if self._tdrag is not None:
+            kind = self._tdrag["kind"]
+        else:
+            frame = self.overlay_frame()
+            kind = hit_test_overlay(frame, pos) if (pos is not None and frame is not None) else None
+        if kind is None:
+            return False
+        shapes = {"tl": Qt.CursorShape.SizeFDiagCursor, "br": Qt.CursorShape.SizeFDiagCursor,
+                  "tr": Qt.CursorShape.SizeBDiagCursor, "bl": Qt.CursorShape.SizeBDiagCursor,
+                  "body": Qt.CursorShape.SizeAllCursor}
+        self.setCursor(shapes[kind])
+        return True
+
+    def _transform_press(self, event) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton or not self.transform_active():
+            return False
+        frame, comp = self.overlay_frame(), self.compose_rect()
+        kind = hit_test_overlay(frame, event.position()) if frame is not None else None
+        if kind is None or comp is None:
+            return False
+        seg = next((s for s, _i, _a in self._overlays if s.id == self._selected_overlay), None)
+        if seg is None:
+            return False
+        self._tdrag = {"id": seg.id, "kind": kind, "origin": QPointF(event.position()),
+                       "frame": QRectF(frame), "comp": QRectF(comp),
+                       "base": (seg.pos_x, seg.pos_y, seg.scale)}
+        self.grabKeyboard()                       # so that Esc reaches us while the button is down
+        self.transformBegan.emit()
+        self._overlay_cursor(event.position())
+        event.accept()
+        return True
+
+    def transform_values(self, pos: QPointF) -> Optional[tuple[float, float, float]]:
+        """``(pos_x, pos_y, scale)`` the running drag gives at pointer ``pos``."""
+        d = self._tdrag
+        if d is None:
+            return None
+        bx, by, bs = d["base"]
+        if d["kind"] == "body":
+            x, y = moved_position(bx, by, pos.x() - d["origin"].x(), pos.y() - d["origin"].y(),
+                                  d["comp"])
+            return x, y, bs
+        return bx, by, resized_scale(bs, d["frame"], d["kind"], pos)
+
+    def _transform_move(self, event) -> bool:
+        if self._tdrag is None:
+            return False
+        vals = self.transform_values(event.position())
+        if vals is not None:
+            self.transformChanged.emit(self._tdrag["id"], *vals)
+        event.accept()
+        return True
+
+    def _transform_release(self, event) -> bool:
+        d = self._tdrag
+        if d is None or event.button() != Qt.MouseButton.LeftButton:
+            return False
+        vals = self.transform_values(event.position())
+        if vals is not None:
+            self.transformChanged.emit(d["id"], *vals)
+        self._tdrag = None
+        self.releaseKeyboard()
+        self.transformEnded.emit()
+        self._overlay_cursor(event.position()) or self.unsetCursor()
+        self.update()
+        event.accept()
+        return True
+
     # reframe handle ------------------------------------------------------------
     def set_interactive(self, on: bool) -> None:
         """Handle / pill are only offered while paused."""
@@ -611,6 +823,7 @@ class _Viewport(QWidget):
             self._interactive = on
             if not on:
                 self.cancel_drag()
+                self.cancel_transform()
             self._update_handle_ui()
             self.update()
 
@@ -672,6 +885,7 @@ class _Viewport(QWidget):
 
     def hideEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self.cancel_drag()
+        self.cancel_transform()
         super().hideEvent(event)
 
     def minimap_rect(self) -> Optional[QRectF]:
@@ -745,6 +959,8 @@ class _Viewport(QWidget):
         return self._drag is not None
 
     def _update_cursor(self, pos: Optional[QPointF]) -> None:
+        if self._overlay_cursor(pos):
+            return
         if not self.handle_active():
             self.unsetCursor()
         elif self._drag is not None:
@@ -759,6 +975,8 @@ class _Viewport(QWidget):
                 self.unsetCursor()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if self._transform_press(event):
+            return
         if event.button() != Qt.MouseButton.LeftButton or not self.handle_active():
             event.ignore()
             return
@@ -781,6 +999,8 @@ class _Viewport(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if self._transform_move(event):
+            return
         if self._drag is not None:
             self._apply_edit(self._drag_value(event.position()))
             self.update()
@@ -790,6 +1010,8 @@ class _Viewport(QWidget):
             event.ignore()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if self._transform_release(event):
+            return
         d = self._drag
         if d is None or event.button() != Qt.MouseButton.LeftButton:
             event.ignore()
@@ -810,6 +1032,10 @@ class _Viewport(QWidget):
         event.accept()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        if self._tdrag is not None and event.key() == Qt.Key.Key_Escape:
+            self.cancel_transform()
+            event.accept()
+            return
         if self._drag is not None and event.key() == Qt.Key.Key_Escape:
             self.cancel_drag()
             event.accept()
@@ -871,8 +1097,9 @@ class _Viewport(QWidget):
                                "Import a file or download a clip to start editing",
                                p.text_faint, p.text_dim)
         else:
-            if canvas is not None:
-                painter.fillRect(canvas, QColor(0, 0, 0))
+            comp = canvas if canvas is not None else (self.compose_rect() if self._overlays else None)
+            if comp is not None:
+                painter.fillRect(comp, QColor(0, 0, 0))
             if self._message:
                 self._paint_notice(painter, canvas if canvas is not None else area, "alert",
                                    self._message, self._detail, p.warning, p.text)
@@ -882,14 +1109,56 @@ class _Viewport(QWidget):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             painter.drawRect(canvas.adjusted(-0.5, -0.5, 0.5, 0.5))
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self._paint_overlays(painter)
         self._paint_captions(painter, canvas)
-        if self.handle_active():
+        if self.handle_active() and not self.transform_active():
             self._paint_minimap(painter)
+        self._paint_transform_handles(painter)
         painter.setClipping(False)
         painter.setPen(QColor(p.border))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
         painter.end()
+
+    def _paint_overlays(self, painter: QPainter) -> None:
+        """Composite the overlay pictures bottom-to-top onto the canvas."""
+        if not self._overlays or self._state == self.PLACEHOLDER:
+            return
+        comp = self.compose_rect()
+        if comp is None:
+            return
+        painter.save()
+        painter.setClipRect(comp, Qt.ClipOperation.IntersectClip)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        for seg, img, aspect in self._overlays:
+            if img is None or img.isNull():
+                continue
+            painter.setOpacity(min(max(seg.opacity, 0.0), 1.0))
+            painter.drawImage(overlay_rect(comp, aspect, seg.pos_x, seg.pos_y, seg.scale), img)
+        painter.restore()
+
+    def _paint_transform_handles(self, painter: QPainter) -> None:
+        if not self.transform_active():
+            return
+        frame = self.overlay_frame()
+        if frame is None:
+            return
+        p = theme.current()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(p.accent), 1))
+        painter.drawRect(QRectF(round(frame.x()) + 0.5, round(frame.y()) + 0.5,
+                                round(frame.width()), round(frame.height())))
+        half = HANDLE_SIZE / 2
+        for c in CORNERS:
+            pt = corner_point(frame, c)
+            r = QRectF(round(pt.x() - half) + 0.5, round(pt.y() - half) + 0.5,
+                       HANDLE_SIZE, HANDLE_SIZE)
+            painter.setPen(QPen(QColor(p.accent), 1))
+            painter.setBrush(QColor(p.accent_text))
+            painter.drawRect(r)
+        painter.restore()
 
     def _paint_captions(self, painter: QPainter, canvas: Optional[QRectF]) -> None:
         doc = self._doc
@@ -1338,6 +1607,233 @@ class _AudioLane:
         self.panel._on_lane_error(self, f"{getattr(error, 'name', error)}: {text}")
 
 
+# ----------------------------------------------------------------------- overlay layer
+class _LayerPlayer:
+    """Player of one overlay track (V2, V3, ...): video sink + audio output, reused for every
+    clip that passes on that layer and kept sync-seeked to the timeline clock by the panel.
+
+    A frame is kept only when it belongs to the current seek and lies inside the source
+    window of the clip the layer is bound to, so a stale picture never survives a cut."""
+
+    def __init__(self, panel: "PreviewPanel", layer: int) -> None:
+        self.panel = panel
+        self.layer = layer
+        self.dead = False
+        self.source_id: Optional[str] = None
+        self.path: Optional[str] = None
+        self.fps = 30.0
+        self.has_video = True
+        self.loaded = False
+        self.ended = False
+        self.want_play = False
+        self.seg_id: Optional[str] = None
+        self.window = (0.0, 0.0)                 # source window of the bound clip
+        self.target: Optional[float] = None      # source seconds last commanded
+        self.pending = False
+        self.seek_wall = 0
+        self.check_wall = 0
+        self.image: Optional[QImage] = None
+        self.player = QMediaPlayer(panel)
+        self.sink = QVideoSink(panel)
+        self.out: Optional[QAudioOutput] = None
+        try:
+            self.out = QAudioOutput(panel)
+            self.out.setMuted(True)
+            self.player.setAudioOutput(self.out)
+        except Exception:                                    # no audio device / backend
+            log.warning("Preview: overlay audio output unavailable", exc_info=True)
+            self.out = None
+        self.player.setVideoSink(self.sink)
+        self.sink.videoFrameChanged.connect(self._on_frame)
+        self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.errorOccurred.connect(self._on_error)
+        self.player.setPlaybackRate(panel.rate())
+
+    @property
+    def fd(self) -> float:
+        return 1.0 / self.fps if self.fps > 0 else 1.0 / 30.0
+
+    # source -----------------------------------------------------------------
+    def bind(self, src: MediaSource) -> bool:
+        if self.source_id == src.id and self.path == src.path:
+            return True
+        self.unbind()
+        if not src.path or not os.path.exists(src.path):
+            return False
+        self.source_id, self.path = src.id, src.path
+        self.fps = src.fps if src.fps and src.fps > 0 else 30.0
+        self.has_video = bool(src.has_video)
+        self.player.setSource(QUrl.fromLocalFile(src.path))
+        return True
+
+    def unbind(self) -> None:
+        self.source_id = self.path = self.seg_id = None
+        self.loaded = self.ended = self.want_play = self.pending = False
+        self.target = None
+        self.image = None
+        if not self.dead:
+            try:
+                self.player.stop()
+                self.player.setSource(QUrl())
+            except RuntimeError:
+                pass
+
+    def park(self) -> None:
+        """No clip on this layer right now: stop, mute and drop the picture."""
+        self.seg_id = None
+        self.image = None
+        self.pending = False
+        self.target = None
+        if self.out is not None:
+            self.out.setMuted(True)
+        if not self.dead and self.want_play:
+            self.set_play(False, 0)
+        self.want_play = False
+
+    def bind_clip(self, seg: Segment) -> None:
+        """Tie the layer to ``seg``; a different clip starts without any picture."""
+        if self.seg_id != seg.id:
+            self.image = None
+            self.target = None
+        self.seg_id = seg.id
+        self.window = (seg.source_in, seg.source_out)
+
+    # commands ---------------------------------------------------------------
+    def seek(self, pos: float, play: bool, now: int) -> None:
+        self.target = max(0.0, pos)
+        self.seek_wall = now
+        self.ended = False
+        self.want_play = play
+        self.pending = self.has_video
+        if self.loaded:
+            self._issue()
+
+    def _issue(self) -> None:
+        player = self.player
+        if player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+            player.pause()
+        ms = int(round((self.target or 0.0) * 1000.0))
+        dur = player.duration()
+        if dur > 0:
+            ms = min(ms, max(0, dur - 1))
+        player.setPosition(ms)
+        if self.want_play:
+            player.play()
+        elif player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            player.pause()
+
+    def set_play(self, play: bool, now: int) -> None:
+        if play == self.want_play:
+            return
+        if play:
+            self.seek_wall = now
+        elif self.loaded and self.target is not None:
+            self.target = self.player.position() / 1000.0
+        self.want_play = play
+        if not self.loaded:
+            return
+        if play:
+            if not self.ended:
+                self.player.play()
+        elif self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+
+    def set_audio(self, volume: float, muted: bool) -> None:
+        if self.out is not None:
+            self.out.setVolume(volume)
+            self.out.setMuted(muted)
+
+    def estimate(self, now: int, rate: float) -> Optional[float]:
+        if not self.loaded or self.target is None:
+            return None
+        if not self.want_play:
+            return self.target
+        if now - self.seek_wall < 400 or self.ended:
+            return self.target + max(0, now - self.seek_wall) / 1000.0 * rate
+        return self.player.position() / 1000.0
+
+    def rebase(self, now: int, rate: float) -> None:
+        est = self.estimate(now, rate)
+        if est is not None and self.want_play:
+            self.target, self.seek_wall = est, now
+
+    def destroy(self) -> None:
+        if self.dead:
+            return
+        self.dead = True
+        self.image = None
+        for sig, fn in ((self.sink.videoFrameChanged, self._on_frame),
+                        (self.player.mediaStatusChanged, self._on_status),
+                        (self.player.errorOccurred, self._on_error)):
+            try:
+                sig.disconnect(fn)
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.player.setVideoSink(None)
+            self.player.setAudioOutput(None)
+        except RuntimeError:
+            pass
+        for obj in (self.player, self.sink, self.out):
+            if obj is not None:
+                try:
+                    obj.deleteLater()
+                except RuntimeError:
+                    pass
+        self.panel._bury(self)
+
+    # player callbacks -------------------------------------------------------
+    def _on_status(self, status) -> None:
+        if self.dead:
+            return
+        S = QMediaPlayer.MediaStatus
+        if status in (S.LoadedMedia, S.BufferedMedia) and not self.loaded and self.source_id:
+            self.loaded = True
+            if self.has_video and not self.player.hasVideo():
+                self.has_video = False
+                self.pending = False
+            self.player.pause()
+            self.target = None                  # let the panel re-issue a fresh position
+            self.panel._on_layer_loaded()
+        elif status == S.EndOfMedia:
+            self.ended = True
+        elif status == S.InvalidMedia:
+            self.panel._on_layer_error(self, "invalid media")
+
+    def _on_error(self, error, text) -> None:
+        if self.dead or error == QMediaPlayer.Error.NoError:
+            return
+        self.panel._on_layer_error(self, f"{getattr(error, 'name', error)}: {text}")
+
+    def _on_frame(self, frame: QVideoFrame) -> None:
+        if self.dead or not frame.isValid() or self.seg_id is None or self.target is None:
+            return
+        start = frame.startTime() / 1e6
+        end = frame.endTime() / 1e6
+        if start < 0:
+            start = self.player.position() / 1000.0
+        if end <= start:
+            end = start + self.fd
+        lo, hi = self.window
+        if start >= hi - _TS_EPS or end <= lo + _TS_EPS:
+            return                                           # outside the clip's source window
+        if self.pending:
+            tol = 0.25 * self.fd
+            if self.want_play:
+                if not self.target - 1.25 * self.fd <= start <= self.target + 1.0:
+                    return                                   # frame of an older seek
+            elif not start - tol <= self.target <= end + tol:
+                return                                       # not the frame that was asked for
+            self.pending = False
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self.image = image
+        self.panel._on_layer_frame(self)
+
+
 # ------------------------------------------------------------------------------ panel
 class PreviewPanel(QWidget):
     """Video viewport + transport bar. Plays the edited timeline of a ``Document``."""
@@ -1355,6 +1851,10 @@ class PreviewPanel(QWidget):
         self._audio_lane: Optional[_AudioLane] = None
         self._audio_bad: set[tuple[str, str]] = set()      # (source id, path) the lane can't play
         self._audio_check_wall = 0
+        self._layers: dict[int, _LayerPlayer] = {}         # one player per overlay track
+        self._layer_bad: set[tuple[str, str]] = set()      # (source id, path) a layer can't play
+        self._layer_sig: tuple = ()
+        self._opacity_busy = False
         self._active: Optional[_Slot] = None
         self._standby: Optional[_Slot] = None
         self._seg: Optional[Segment] = None
@@ -1398,6 +1898,9 @@ class PreviewPanel(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(800)
         self._save_timer.timeout.connect(self._save_volume)
+        self._layer_timer = QTimer(self)               # retry a paused overlay seek that was held back
+        self._layer_timer.setSingleShot(True)
+        self._layer_timer.timeout.connect(self._sync_layers)
 
         self._build_ui()
 
@@ -1410,6 +1913,8 @@ class PreviewPanel(QWidget):
         document.canvasChanged.connect(self._on_canvas_changed)
         document.captionsChanged.connect(self._on_captions_changed)
         document.selectionChanged.connect(self._refresh_reframe)
+        document.selectionChanged.connect(self._refresh_overlays)
+        document.tracksChanged.connect(self._refresh_overlays)
 
         self._t = document.playhead
         self._update_time_label()
@@ -1425,6 +1930,10 @@ class PreviewPanel(QWidget):
         self._viewport.set_document(self._doc)
         self._viewport.cropCommitted.connect(self._on_crop_committed)
         self._viewport.modeRequested.connect(self._on_mode_requested)
+        self._viewport.transformBegan.connect(self._doc.begin_drag)
+        self._viewport.transformChanged.connect(self._on_transform_changed)
+        self._viewport.transformEnded.connect(self._on_transform_ended)
+        self._viewport.transformCancelled.connect(self._doc.cancel_drag)
         root.addWidget(self._viewport, 1)
 
         bar = QWidget(self)
@@ -1468,6 +1977,18 @@ class PreviewPanel(QWidget):
         right = QHBoxLayout()
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(6)
+        self._opacity_slider = QSlider(Qt.Orientation.Horizontal, bar)
+        self._opacity_slider.setRange(0, 100)
+        self._opacity_slider.setValue(100)
+        self._opacity_slider.setFixedWidth(72)
+        self._opacity_slider.setToolTip("Opacity of the selected overlay clip")
+        self._opacity_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self._opacity_slider.sliderPressed.connect(self._doc.begin_drag)
+        self._opacity_slider.sliderReleased.connect(self._on_transform_ended)
+        self._opacity_slider.hide()
+        right.addWidget(self._opacity_slider)
+        right.addSpacing(6)
         self._rate_combo = QComboBox(bar)
         for r in RATES:
             self._rate_combo.addItem(f"{r:g}x", r)
@@ -1568,6 +2089,7 @@ class PreviewPanel(QWidget):
             else:
                 slot.set_audio(vol, True)
         self._sync_audio()
+        self._sync_layers()
 
     def _on_volume_changed(self, value: int) -> None:
         self._volume = value / 100.0
@@ -1673,6 +2195,10 @@ class PreviewPanel(QWidget):
         if self._audio_lane is not None and not self._audio_lane.dead:
             self._audio_lane.rebase(now, self._rate)
             self._audio_lane.player.setPlaybackRate(rate)
+        for lp in self._layers.values():
+            if not lp.dead:
+                lp.rebase(now, self._rate)
+                lp.player.setPlaybackRate(rate)
         self._rate = rate
         for slot in self._slots:
             slot.player.setPlaybackRate(rate)
@@ -1720,6 +2246,7 @@ class PreviewPanel(QWidget):
             self._audio_lane.destroy()
             self._audio_lane = None
         self._audio_bad.clear()
+        self._release_layers()
         self._active = self._standby = None
         self._seg = None
         self._mode = _MODE_IDLE
@@ -1734,7 +2261,8 @@ class PreviewPanel(QWidget):
         if self._shut:
             return
         self._shut = True
-        for timer in (self._timer, self._scrub_timer, self._settle_timer, self._resync_timer):
+        for timer in (self._timer, self._scrub_timer, self._settle_timer, self._resync_timer,
+                      self._layer_timer):
             timer.stop()
         if self._save_timer.isActive():
             self._save_volume()
@@ -1747,7 +2275,9 @@ class PreviewPanel(QWidget):
                         (doc.playheadChanged, self._on_playhead_for_captions),
                         (doc.canvasChanged, self._on_canvas_changed),
                         (doc.captionsChanged, self._on_captions_changed),
-                        (doc.selectionChanged, self._refresh_reframe)):
+                        (doc.selectionChanged, self._refresh_reframe),
+                        (doc.selectionChanged, self._refresh_overlays),
+                        (doc.tracksChanged, self._refresh_overlays)):
             try:
                 sig.disconnect(fn)
             except (RuntimeError, TypeError):
@@ -1895,6 +2425,7 @@ class PreviewPanel(QWidget):
         self._update_time_label()
         self._update_enabled()
         self._refresh_reframe()
+        self._refresh_overlays()
         self._resync_timer.start()
 
     def _on_sources_changed(self) -> None:
@@ -1916,6 +2447,8 @@ class PreviewPanel(QWidget):
             if src is None or src.path != lane.path:
                 lane.unbind()
         self._audio_bad = {(sid, p) for sid, p in self._audio_bad
+                           if sid in sources and sources[sid].path == p}
+        self._layer_bad = {(sid, p) for sid, p in self._layer_bad
                            if sid in sources and sources[sid].path == p}
         self._resync_timer.start()
 
@@ -2057,6 +2590,186 @@ class PreviewPanel(QWidget):
         finally:
             self._in_enter = False
         self._sync_audio()
+        self._sync_layers()
+
+    # overlay layers ---------------------------------------------------------
+    def _release_layers(self) -> None:
+        self._layer_timer.stop()
+        for lp in list(self._layers.values()):
+            lp.destroy()
+        self._layers.clear()
+        self._layer_bad.clear()
+        self._layer_sig = ()
+        self._viewport.set_overlays([], None, None)
+
+    def layer_state(self) -> dict[int, dict]:
+        """Diagnostics: per overlay layer the bound clip / source, audibility and picture."""
+        return {n: {"seg_id": lp.seg_id, "source_id": lp.source_id, "target": lp.target,
+                    "loaded": lp.loaded, "has_image": lp.image is not None,
+                    "audible": bool(lp.out is not None and not lp.out.isMuted() and lp.want_play)}
+                for n, lp in self._layers.items() if not lp.dead}
+
+    def _selected_overlay_id(self) -> Optional[str]:
+        """The selected overlay clip under the playhead that carries the handles."""
+        doc = self._doc
+        picked = {s.id for s in doc.selected_segments() if s.is_overlay}
+        if not picked:
+            return None
+        for seg in reversed(doc.timeline.segments_at(self._t)):
+            if seg.id in picked:
+                return seg.id
+        return None
+
+    def _canvas_hint(self) -> Optional[float]:
+        """Aspect of the canvas for the source aspect: the first clip of the lowest track."""
+        for track in self._doc.timeline.tracks:
+            if track:
+                src = self._doc.sources.get(track[0].source_id)
+                if src is not None and src.width > 0 and src.height > 0:
+                    return src.width / src.height
+                return None
+        return None
+
+    def _refresh_overlays(self, *_args) -> None:
+        """Hand the viewport the overlay clips under the playhead with their pictures."""
+        if self._shut:
+            return
+        tl = self._doc.timeline
+        items = []
+        for seg in tl.segments_at(self._t):
+            if seg.layer < 1 or seg.is_audio:
+                continue
+            lp = self._layers.get(seg.layer)
+            img = lp.image if (lp is not None and not lp.dead and lp.seg_id == seg.id) else None
+            src = self._doc.sources.get(seg.source_id)
+            if src is not None and src.width > 0 and src.height > 0:
+                aspect = src.width / src.height
+            elif img is not None and img.height() > 0:
+                aspect = img.width() / img.height()
+            else:
+                aspect = 16 / 9
+            items.append((seg.copy(), img, aspect))
+        self._viewport.set_overlays(items, self._selected_overlay_id(), self._canvas_hint())
+        self._update_opacity_ui()
+
+    def _sync_layers(self, tick: bool = False) -> None:
+        """Make every overlay player match the clip of its track under the playhead: bind,
+        seek (exact frame while paused, drift-corrected while playing), audio, and park the
+        players of tracks that have no clip right now."""
+        if self._shut:
+            return
+        doc = self._doc
+        tl = doc.timeline
+        now = self._now()
+        active = {s.layer: s for s in tl.segments_at(self._t) if s.layer >= 1 and not s.is_audio}
+        for layer in list(self._layers):
+            lp = self._layers[layer]
+            if layer >= tl.track_count:
+                del self._layers[layer]
+                lp.destroy()
+            elif layer not in active:
+                lp.park()
+        vol = self._linear_volume()
+        for layer, seg in active.items():
+            lp = self._layers.get(layer)
+            src = doc.sources.get(seg.source_id)
+            if (src is None or (src.id, src.path) in self._layer_bad
+                    or self._source_problem(src) is not None):
+                if lp is not None:
+                    lp.park()
+                continue
+            if lp is None or lp.dead:
+                try:
+                    lp = _LayerPlayer(self, layer)
+                except Exception:
+                    log.exception("Preview: could not create the player of layer %d", layer)
+                    self._layer_bad.add((src.id, src.path))
+                    continue
+                self._layers[layer] = lp
+            if not lp.bind(src):
+                self._layer_bad.add((src.id, src.path))
+                lp.park()
+                continue
+            lp.bind_clip(seg)
+            fd = src.frame_duration if src.frame_duration > 0 else GAP_FRAME
+            target = min(max(seg.to_source(self._t), seg.source_in),
+                         max(seg.source_in, seg.source_out - min(0.5 * fd, 0.5 * seg.duration)))
+            audible = self._playing and not self._muted and not seg.muted and src.has_audio
+            if self._playing:
+                est = lp.estimate(now, self._rate)
+                if lp.target is None or not lp.want_play:
+                    lp.seek(target, True, now)
+                elif est is not None and abs(est - target) > 0.12 and now - lp.seek_wall > 500:
+                    lp.seek(target, True, now)
+                else:
+                    lp.set_play(True, now)
+            else:
+                pos = self._frame_pos(src, target)
+                same = (lp.target is not None and not lp.want_play
+                        and _frame_index(lp.target, lp.fps) == _frame_index(pos, lp.fps))
+                if not same:
+                    if lp.pending and lp.loaded and now - lp.seek_wall < _SCRUB_COALESCE_MS:
+                        self._layer_timer.start(_SCRUB_COALESCE_MS)     # latest seek wins, later
+                    else:
+                        lp.seek(pos, False, now)
+            lp.set_audio(vol, not audible)
+        sig = tuple((s.id, lp.image is not None) for layer, s in sorted(active.items())
+                    for lp in [self._layers.get(layer)] if lp is not None) + (
+                        tuple(sorted(active)),)
+        if sig != self._layer_sig:
+            self._layer_sig = sig
+            self._refresh_overlays()
+
+    def _on_layer_loaded(self) -> None:
+        if not self._shut:
+            self._sync_layers()
+
+    def _on_layer_frame(self, lp: _LayerPlayer) -> None:
+        if self._shut or lp.dead:
+            return
+        self._refresh_overlays()
+
+    def _on_layer_error(self, lp: _LayerPlayer, text: str) -> None:
+        if lp.dead:
+            return
+        log.error("Preview: cannot play overlay %s (%s)", lp.path, text)
+        if lp.source_id and lp.path:
+            self._layer_bad.add((lp.source_id, lp.path))
+        lp.unbind()
+        if not self._shut:
+            self._layer_sig = ()
+            QTimer.singleShot(0, self._refresh_overlays)
+
+    # overlay transform (handles + opacity) -----------------------------------
+    def _on_transform_changed(self, seg_id: str, x: float, y: float, scale: float) -> None:
+        """Live handle drag: one ``Document.set_transform`` per move (undo step at the end)."""
+        self._doc.set_transform([seg_id], x=x, y=y, scale=scale)
+
+    def _on_transform_ended(self) -> None:
+        self._doc.end_drag("Transform clip")
+        self._refresh_overlays()
+
+    def _opacity_targets(self) -> list[Segment]:
+        return [s for s in self._doc.selected_segments() if s.is_overlay]
+
+    def _update_opacity_ui(self) -> None:
+        if self._shut:
+            return
+        targets = self._opacity_targets()
+        slider = self._opacity_slider
+        if slider.isHidden() == bool(targets):
+            slider.setVisible(bool(targets))
+        if targets and not slider.isSliderDown():
+            self._opacity_busy = True
+            slider.setValue(int(round(targets[0].opacity * 100)))
+            self._opacity_busy = False
+
+    def _on_opacity_changed(self, value: int) -> None:
+        if self._opacity_busy:
+            return
+        ids = [s.id for s in self._opacity_targets()]
+        if ids:
+            self._doc.set_transform(ids, opacity=value / 100.0)
 
     # audio lane -------------------------------------------------------------
     def _sync_audio(self, tick: bool = False) -> None:
@@ -2337,6 +3050,7 @@ class PreviewPanel(QWidget):
         else:
             self._enter(self._t)
         self._sync_audio(tick=True)
+        self._sync_layers(tick=True)
 
     # slot callbacks ---------------------------------------------------------
     def _on_slot_frame(self, slot: _Slot) -> None:

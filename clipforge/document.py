@@ -35,6 +35,7 @@ class Document(QObject):
     message = Signal(str)             # short status-bar text (e.g. why an edit was refused)
     canvasChanged = Signal()          # output aspect / reframe mode changed
     captionsChanged = Signal()        # caption lines, style or staleness changed
+    tracksChanged = Signal()          # the number of video tracks changed (before timelineChanged)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -42,6 +43,7 @@ class Document(QObject):
         self._selection: list[str] = []
         self._dirty = False
         self._drag_snapshot: Optional[list[Segment]] = None
+        self._track_count = self.project.timeline.track_count
 
     # ----------------------------------------------------------------- access
     @property
@@ -71,6 +73,11 @@ class Document(QObject):
     @property
     def duration(self) -> float:
         return self.timeline.duration
+
+    @property
+    def track_count(self) -> int:
+        """Number of video tracks (V1 plus overlay tracks)."""
+        return self.timeline.track_count
 
     @property
     def dirty(self) -> bool:
@@ -104,8 +111,10 @@ class Document(QObject):
         self._selection = []
         self._drag_snapshot = None
         self._dirty = False
+        self._track_count = project.timeline.track_count
         self.projectReset.emit()
         self.sourcesChanged.emit()
+        self.tracksChanged.emit()
         self.timelineChanged.emit()
         self.selectionChanged.emit()
         self.historyChanged.emit()
@@ -147,14 +156,33 @@ class Document(QObject):
             self._set_dirty(True)
 
     # ------------------------------------------------------------------ media
-    def add_source(self, source: MediaSource, to_timeline: bool = True) -> None:
-        """Add media to the library and (by default) append it to the timeline."""
+    def add_source(self, source: MediaSource, to_timeline: bool = True,
+                   track: Optional[int] = None, at: Optional[float] = None) -> None:
+        """Add media to the library and (by default) put it on the timeline: appended to
+        V1, or with ``track`` placed on that video track at ``at`` (default: the playhead)."""
         self.sources[source.id] = source
         self.sourcesChanged.emit()
-        if to_timeline:
+        if to_timeline and track is None:
             self.append_to_timeline(source.id)
-        else:
-            self._set_dirty(True)
+        elif not to_timeline or not self.place_on_timeline(source.id, track, at):
+            self._set_dirty(True)             # in the library even if it could not be placed
+
+    def place_on_timeline(self, source_id: str, track: int, at: Optional[float] = None) -> bool:
+        """Put library media on a video track at ``at`` (default: the playhead), shifted to
+        the nearest free slot if needed. ``track == track_count`` adds a new top track in
+        the same undo step. The new clip becomes the selection."""
+        source = self.sources[source_id]
+        before = self.timeline.snapshot()
+        try:
+            if track == self.timeline.track_count:
+                self.timeline.add_track()
+            seg = self.timeline.place_source(source, track, self.playhead if at is None else at)
+        except EditError as exc:
+            self.timeline.restore(before)
+            return self._refuse(exc)
+        self._committed("Add clip", before)
+        self.select([seg.id])
+        return True
 
     def append_to_timeline(self, source_id: str) -> None:
         source = self.sources[source_id]
@@ -226,6 +254,7 @@ class Document(QObject):
         selection_changed = pruned != self._selection
         self._selection = pruned
         self._set_dirty(True)
+        self._emit_tracks_if_changed()
         self.timelineChanged.emit()
         self.historyChanged.emit()
         if selection_changed:
@@ -235,16 +264,51 @@ class Document(QObject):
         else:
             self.seekRequested.emit(self.project.playhead)   # refresh the preview frame
 
+    def _emit_tracks_if_changed(self) -> None:
+        count = self.timeline.track_count
+        if count != self._track_count:
+            self._track_count = count
+            self.tracksChanged.emit()
+
     def _refuse(self, exc: Exception) -> bool:
         self.message.emit(str(exc))
         return False
+
+    def _under_playhead(self) -> Optional[Segment]:
+        """The V1 clip under the playhead, else the top-most overlay clip under it."""
+        stack = self.timeline.segments_at(self.playhead)
+        if not stack:
+            return None
+        return stack[0] if stack[0].layer == 0 else stack[-1]
+
+    # ----------------------------------------------------------------- tracks
+    def add_track(self, index: Optional[int] = None) -> int:
+        """Add an empty video track (default: on top). Returns its index, or -1 if refused."""
+        before = self.timeline.snapshot()
+        try:
+            made = self.timeline.add_track(index)
+        except EditError as exc:
+            self._refuse(exc)
+            return -1
+        self._committed("Add track", before)
+        return made
+
+    def remove_track(self, index: int, delete_clips: bool = False) -> bool:
+        """Remove a video track (never V1). A track with clips needs ``delete_clips``."""
+        before = self.timeline.snapshot()
+        try:
+            self.timeline.remove_track(index, delete_clips=delete_clips)
+        except EditError as exc:
+            return self._refuse(exc)
+        self._committed("Remove track", before)
+        return True
 
     def split_at_playhead(self) -> bool:
         """Split the selected clip(s) under the playhead, or else the clip under it."""
         t = self.playhead
         targets = [s for s in self.selected_segments() if s.contains(t)]
         if not targets:
-            under = self.timeline.segment_at(t)
+            under = self._under_playhead()
             targets = [under] if under else []
         if not targets:
             return self._refuse(EditError("Move the playhead over a clip to split it."))
@@ -281,12 +345,24 @@ class Document(QObject):
         self._committed("Move clip", before)
         return True
 
-    def move_clip(self, segment_id: str, new_start: float) -> bool:
-        """Slide a clip to ``new_start`` (clamped between its neighbours). One undo step."""
+    def move_clip(self, segment_id: str, new_start: float, track: Optional[int] = None) -> bool:
+        """Move a clip to ``new_start``. One undo step.
+
+        Without ``track`` it slides on its own lane, clamped between its neighbours. With
+        ``track`` it is placed on that video track (nearest free slot); ``track ==
+        track_count`` creates a new top track for it in the same undo step."""
         before = self.timeline.snapshot()
+        added = False
         try:
-            self.timeline.move_to(segment_id, new_start)
+            if track is not None and track == self.timeline.track_count:
+                if self.timeline.get(segment_id).is_audio:
+                    raise EditError("Audio clips stay on the audio lane.")
+                self.timeline.add_track()
+                added = True
+            self.timeline.move_to(segment_id, new_start, track)
         except EditError:
+            if added:
+                self.timeline.restore(before)
             return False                      # dropped where it already was: not an error
         self._committed("Move clip", before)
         return True
@@ -313,7 +389,7 @@ class Document(QObject):
         onto the audio lane. One undo step; the new audio clips become the selection."""
         ids = [s.id for s in self.selected_segments() if not s.is_audio]
         if not ids:
-            under = self.timeline.segment_at(self.playhead)
+            under = self._under_playhead()
             ids = [under.id] if under else []
         if not ids:
             return self._refuse(EditError("Select a video clip to detach its audio."))
@@ -334,6 +410,26 @@ class Document(QObject):
         except EditError as exc:
             return self._refuse(exc)
         self._committed("Reframe clip", before)
+        return True
+
+    def set_transform(self, segment_ids: Iterable[str], x: Optional[float] = None,
+                      y: Optional[float] = None, scale: Optional[float] = None,
+                      opacity: Optional[float] = None) -> bool:
+        """Position (fractions of the canvas, 0 = centred), scale (fraction of the canvas
+        width) and opacity of overlay clips; ``None`` keeps a value.
+
+        Between ``begin_drag()`` and ``end_drag("Transform clip")`` it applies live with no
+        undo step of its own; otherwise it is one undo step."""
+        live = self._drag_snapshot is not None
+        before = None if live else self.timeline.snapshot()
+        try:
+            self.timeline.set_transform(segment_ids, x, y, scale, opacity)
+        except EditError as exc:
+            return False if live else self._refuse(exc)
+        if live:
+            self.timelineChanged.emit()
+        else:
+            self._committed("Transform clip", before)
         return True
 
     # ---------------------------------------------------------------- canvas
@@ -429,10 +525,10 @@ class Document(QObject):
             self._set_dirty(True)
             self.captionsChanged.emit()
 
-    def close_gaps(self) -> bool:
+    def close_gaps(self, track: int = 0) -> bool:
         before = self.timeline.snapshot()
         try:
-            self.timeline.close_gaps()
+            self.timeline.close_gaps(track)
         except EditError as exc:
             return self._refuse(exc)
         self._committed("Close gaps", before)
@@ -485,6 +581,7 @@ class Document(QObject):
         before, self._drag_snapshot = self._drag_snapshot, None
         if before is not None:
             self.timeline.restore(before)
+            self._emit_tracks_if_changed()
             self.timelineChanged.emit()
 
     # ---------------------------------------------------------------- history

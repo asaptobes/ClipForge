@@ -5,10 +5,12 @@ Two time domains are kept strictly apart:
 * **source time**  - seconds inside an original media file (``source_in`` / ``source_out``)
 * **timeline time** - seconds on the edited timeline (``timeline_start`` / ``timeline_end``)
 
-A :class:`Timeline` is a single track of non-overlapping :class:`Segment` objects kept
-sorted by ``timeline_start``; the list index is the segment order. Gaps are allowed
-(a plain delete leaves one, a ripple delete closes it). Nothing here touches media
-files, so every operation is cheap, deterministic and unit-testable.
+A :class:`Timeline` holds any number of video tracks (V1 is the base, higher tracks are
+composited on top) plus one audio lane. Each lane is a list of non-overlapping
+:class:`Segment` objects kept sorted by ``timeline_start``; clips on different lanes may
+overlap in time. Gaps are allowed (a plain delete leaves one, a ripple delete closes it).
+Nothing here touches media files, so every operation is cheap, deterministic and
+unit-testable. The public contract is written down in ``docs/multitrack-contract.md``.
 """
 
 from __future__ import annotations
@@ -20,6 +22,12 @@ from typing import Iterable, Optional
 EPS = 1e-6
 #: Shortest segment an edit may produce when the source frame rate is unknown.
 MIN_SEGMENT_DURATION = 0.04
+#: Most video tracks a timeline may hold (V1 plus overlays).
+MAX_VIDEO_TRACKS = 8
+#: Limits of an overlay clip's transform.
+SCALE_MIN = 0.05
+SCALE_MAX = 4.0
+POS_LIMIT = 1.0
 
 
 class EditError(ValueError):
@@ -36,6 +44,21 @@ def _unit(value, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return min(max(v, 0.0), 1.0) if v == v else default
+
+
+def _clamped(value, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, lo), hi) if v == v else default
+
+
+def _layer(value) -> int:
+    try:
+        return min(max(0, int(value)), MAX_VIDEO_TRACKS - 1)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 @dataclass
@@ -97,13 +120,29 @@ class Segment:
     #: from ``crop_x`` (clip start) to ``crop_x_end`` (clip end).
     crop_x: float = 0.5
     crop_x_end: Optional[float] = None
-    #: Which lane the clip lives on: "video" (picture + its own sound) or "audio"
-    #: (a detached sound-only clip). Both lanes use the same fields and rules.
+    #: Which kind of lane the clip lives on: "video" (picture + its own sound) or "audio"
+    #: (a detached sound-only clip). Both kinds use the same fields and rules.
     track: str = "video"
+    #: Video track index: 0 = V1 (the base track), 1 = V2 ... Higher layers are drawn on
+    #: top of lower ones. Always 0 for audio clips.
+    layer: int = 0
+    #: Overlay transform, used on layers >= 1 only. ``pos_x`` / ``pos_y`` are the offset of
+    #: the clip centre from the canvas centre as fractions of the canvas width / height
+    #: (+x right, +y down); ``scale`` is the rendered width as a fraction of the canvas
+    #: width; ``opacity`` runs from 0 (invisible) to 1 (opaque).
+    pos_x: float = 0.0
+    pos_y: float = 0.0
+    scale: float = 1.0
+    opacity: float = 1.0
 
     @property
     def is_audio(self) -> bool:
         return self.track == "audio"
+
+    @property
+    def is_overlay(self) -> bool:
+        """True for a video clip above the base track."""
+        return self.track != "audio" and self.layer > 0
 
     @property
     def duration(self) -> float:
@@ -138,6 +177,7 @@ class Segment:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Segment":
+        is_audio = d.get("track") == "audio"
         return cls(
             id=d["id"],
             source_id=d["source_id"],
@@ -145,57 +185,163 @@ class Segment:
             source_out=float(d["source_out"]),
             timeline_start=float(d["timeline_start"]),
             muted=bool(d.get("muted", False)),
-            track="audio" if d.get("track") == "audio" else "video",
+            track="audio" if is_audio else "video",
             crop_x=_unit(d.get("crop_x", 0.5), 0.5),
             crop_x_end=None if d.get("crop_x_end") is None else _unit(d.get("crop_x_end"), 0.5),
+            layer=0 if is_audio else _layer(d.get("layer", 0)),
+            pos_x=_clamped(d.get("pos_x", 0.0), 0.0, -POS_LIMIT, POS_LIMIT),
+            pos_y=_clamped(d.get("pos_y", 0.0), 0.0, -POS_LIMIT, POS_LIMIT),
+            scale=_clamped(d.get("scale", 1.0), 1.0, SCALE_MIN, SCALE_MAX),
+            opacity=_unit(d.get("opacity", 1.0), 1.0),
         )
 
 
-class Timeline:
-    """Ordered single-track sequence of segments plus the edit operations on it.
+class TimelineSnapshot(list):
+    """Copies of every clip plus the number of video tracks (so empty tracks survive undo).
 
-    Every mutating method either applies completely or raises :class:`EditError`
-    leaving the timeline untouched.
+    It is a plain ``list`` of :class:`Segment` for everything that only reads clips.
+    """
+
+    def __init__(self, segments: Iterable[Segment] = (), track_count: int = 1) -> None:
+        super().__init__(segments)
+        needed = max((s.layer for s in self if not s.is_audio), default=0) + 1
+        self.track_count: int = max(1, int(track_count), needed)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, TimelineSnapshot) and other.track_count != self.track_count:
+            return False
+        return list.__eq__(self, other)
+
+    def __ne__(self, other) -> bool:
+        return not self.__eq__(other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+def _overlaps(a_start: float, a_end: float, b: Segment) -> bool:
+    return a_start < b.timeline_end - EPS and a_end > b.timeline_start + EPS
+
+
+class Timeline:
+    """Video tracks V1..Vn plus one audio lane, and the edit operations on them.
+
+    ``video_tracks[0]`` (also reachable as ``segments``) is the base track; higher tracks
+    are overlays composited on top. Every mutating method either applies completely or
+    raises :class:`EditError` leaving the timeline untouched.
     """
 
     def __init__(self, sources: Optional[dict[str, MediaSource]] = None,
-                 segments: Optional[Iterable[Segment]] = None) -> None:
+                 segments: Optional[Iterable[Segment]] = None, track_count: int = 1) -> None:
         self.sources: dict[str, MediaSource] = sources if sources is not None else {}
-        everything = [s.copy() for s in (segments or [])]
-        self.segments: list[Segment] = [s for s in everything if not s.is_audio]   # video lane
-        self.audio: list[Segment] = [s for s in everything if s.is_audio]          # audio lane
+        self.video_tracks: list[list[Segment]] = [[]]
+        self.audio: list[Segment] = []                                             # audio lane
+        self._distribute([s.copy() for s in (segments or [])], track_count)
+
+    # ------------------------------------------------------------------- lanes
+    def _distribute(self, everything: list[Segment], track_count: int) -> None:
+        videos = [s for s in everything if not s.is_audio]
+        count = max(1, int(track_count), max((s.layer for s in videos), default=0) + 1)
+        self.video_tracks = [[] for _ in range(count)]
+        for s in videos:
+            self.video_tracks[max(0, s.layer)].append(s)
+        self.audio = [s for s in everything if s.is_audio]
+        self._sort()
+
+    def _sort(self) -> None:
+        for i, lane in enumerate(self.video_tracks):
+            lane.sort(key=lambda s: s.timeline_start)
+            for s in lane:
+                s.layer = i
+        self.audio.sort(key=lambda s: s.timeline_start)
+        for s in self.audio:
+            s.layer = 0
+
+    @property
+    def segments(self) -> list[Segment]:
+        """The base video track V1."""
+        return self.video_tracks[0]
+
+    @segments.setter
+    def segments(self, value: list[Segment]) -> None:
+        self.video_tracks[0] = value
+
+    @property
+    def tracks(self) -> list[list[Segment]]:
+        """Video tracks bottom-to-top (index == ``Segment.layer``)."""
+        return self.video_tracks
+
+    @property
+    def track_count(self) -> int:
+        return len(self.video_tracks)
+
+    def track(self, index: int) -> list[Segment]:
+        """Clips of one video track."""
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(self.video_tracks):
+            raise EditError(f"No such video track: {index}")
+        return self.video_tracks[index]
+
+    def add_track(self, index: Optional[int] = None) -> int:
+        """Insert an empty video track (default: on top). Returns its index."""
+        count = len(self.video_tracks)
+        if index is None:
+            index = count
+        if isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= count:
+            raise EditError("A track can only be added above the base track.")
+        if count >= MAX_VIDEO_TRACKS:
+            raise EditError(f"A project can have at most {MAX_VIDEO_TRACKS} video tracks.")
+        self.video_tracks.insert(index, [])
+        self._sort()
+        return index
+
+    def remove_track(self, index: int, move_to: Optional[int] = None,
+                     delete_clips: bool = False) -> None:
+        """Remove a video track. Its clips are moved to ``move_to`` (same times, must not
+        overlap there), deleted with ``delete_clips``, or else the track must be empty."""
+        lane = self.track(index)
+        if index == 0:
+            raise EditError("The base track cannot be removed.")
+        if lane and move_to is not None:
+            target = self.track(move_to)
+            if move_to == index:
+                raise EditError("Choose a different track to move the clips to.")
+            if any(_overlaps(s.timeline_start, s.timeline_end, o) for s in lane for o in target):
+                raise EditError("The clips do not fit on that track.")
+            target.extend(lane)
+        elif lane and not delete_clips:
+            raise EditError("The track still has clips. Delete or move them first.")
+        del self.video_tracks[index]
         self._sort()
 
     # ------------------------------------------------------------------ queries
-    def _sort(self) -> None:
-        self.segments.sort(key=lambda s: s.timeline_start)
-        self.audio.sort(key=lambda s: s.timeline_start)
-
     @property
     def duration(self) -> float:
-        """End of the last clip on either lane."""
-        return max((s.timeline_end for s in self.segments + self.audio), default=0.0)
+        """End of the last clip on any lane."""
+        return max((s.timeline_end for s in self.all_segments()), default=0.0)
 
     @property
     def video_duration(self) -> float:
-        return max((s.timeline_end for s in self.segments), default=0.0)
+        return max((s.timeline_end for s in self.video_segments()), default=0.0)
 
     def is_empty(self) -> bool:
-        return not self.segments and not self.audio
+        return not self.audio and not any(self.video_tracks)
+
+    def video_segments(self) -> list[Segment]:
+        """Every video clip: V1, then V2 ... (bottom-to-top)."""
+        return [s for lane in self.video_tracks for s in lane]
 
     def all_segments(self) -> list[Segment]:
-        """Video lane followed by audio lane."""
-        return self.segments + self.audio
+        """Video tracks bottom-to-top followed by the audio lane."""
+        return self.video_segments() + self.audio
 
     def lane_of(self, segment_id: str) -> list[Segment]:
-        """The lane list (``segments`` or ``audio``) holding this clip."""
-        for lane in (self.segments, self.audio):
+        """The lane list (a video track or ``audio``) holding this clip."""
+        for lane in (*self.video_tracks, self.audio):
             if any(s.id == segment_id for s in lane):
                 return lane
         raise EditError(f"No such segment: {segment_id}")
 
     def get(self, segment_id: str) -> Segment:
-        for s in self.segments + self.audio:
+        for s in self.all_segments():
             if s.id == segment_id:
                 return s
         raise EditError(f"No such segment: {segment_id}")
@@ -214,46 +360,80 @@ class Timeline:
                 return s
         return None
 
-    def segment_at(self, t: float) -> Optional[Segment]:
-        """Segment under timeline time ``t`` or ``None`` when ``t`` is in a gap."""
-        for s in self.segments:
+    def segment_at(self, t: float, track: int = 0) -> Optional[Segment]:
+        """Clip under timeline time ``t`` on one video track (default V1), else ``None``."""
+        for s in self.track(track):
             if s.contains(t):
                 return s
         return None
 
-    def next_segment_after(self, t: float) -> Optional[Segment]:
+    def segments_at(self, t: float) -> list[Segment]:
+        """Video clips under ``t`` on every track, bottom-to-top (compositing order)."""
+        out = []
+        for lane in self.video_tracks:
+            for s in lane:
+                if s.contains(t):
+                    out.append(s)
+                    break
+        return out
+
+    def next_segment_after(self, t: float, track: int = 0) -> Optional[Segment]:
         """First segment starting at or after ``t`` (used to play across gaps)."""
-        for s in self.segments:
+        for s in self.track(track):
             if s.timeline_start >= t - EPS:
                 return s
         return None
 
+    def next_start_after(self, t: float) -> Optional[float]:
+        """Earliest clip start later than ``t`` on any lane (``None`` if there is none)."""
+        return min((s.timeline_start for s in self.all_segments() if s.timeline_start > t + EPS),
+                   default=None)
+
     def to_source(self, t: float) -> Optional[tuple[Segment, float]]:
-        """Map timeline time to ``(segment, source_time)``; ``None`` inside a gap."""
+        """Map timeline time to ``(segment, source_time)`` on V1; ``None`` inside a gap."""
         s = self.segment_at(t)
         return (s, s.to_source(t)) if s else None
 
     def to_timeline(self, segment_id: str, source_time: float) -> float:
         return self.get(segment_id).to_timeline(source_time)
 
-    def gaps(self) -> list[tuple[float, float]]:
-        """``(start, end)`` of every empty stretch, including a leading one."""
+    def gaps(self, track: int = 0) -> list[tuple[float, float]]:
+        """``(start, end)`` of every empty stretch of a video track, including a leading one."""
         out, cursor = [], 0.0
-        for s in self.segments:
+        for s in self.track(track):
             if s.timeline_start - cursor > EPS:
                 out.append((cursor, s.timeline_start))
             cursor = s.timeline_end
         return out
 
-    def snapshot(self) -> list[Segment]:
-        """Copies of every clip on both lanes (each carries its ``track``)."""
-        return [s.copy() for s in self.segments + self.audio]
+    def fit_start(self, track: int, start: float, duration: float,
+                  exclude: Iterable[str] = ()) -> float:
+        """Start time nearest to ``start`` where a clip of ``duration`` fits on a video
+        track without overlapping (``start`` itself when that slot is free)."""
+        ex = set(exclude)
+        others = [s for s in self.track(track) if s.id not in ex]
+        start = max(0.0, float(start))
+
+        def free(c: float) -> bool:
+            return not any(_overlaps(c, c + duration, o) for o in others)
+
+        if free(start):
+            return start
+        candidates = [0.0]
+        for o in others:
+            candidates.append(o.timeline_end)
+            if o.timeline_start - duration >= 0.0:
+                candidates.append(o.timeline_start - duration)
+        fitting = [c for c in candidates if free(c)]      # never empty: after the last clip
+        return min(fitting, key=lambda c: (abs(c - start), -c))
+
+    def snapshot(self) -> TimelineSnapshot:
+        """Copies of every clip on all lanes plus the number of video tracks."""
+        return TimelineSnapshot((s.copy() for s in self.all_segments()), len(self.video_tracks))
 
     def restore(self, snapshot: Iterable[Segment]) -> None:
-        everything = [s.copy() for s in snapshot]
-        self.segments = [s for s in everything if not s.is_audio]
-        self.audio = [s for s in everything if s.is_audio]
-        self._sort()
+        count = getattr(snapshot, "track_count", 1)
+        self._distribute([s.copy() for s in snapshot], count)
 
     def _frame(self, seg: Segment) -> float:
         src = self.sources.get(seg.source_id)
@@ -271,10 +451,10 @@ class Timeline:
         return round(source_time * src.fps) / src.fps
 
     def snap_points(self, exclude: Iterable[str] = ()) -> list[float]:
-        """Clip edges (and 0) that dragged edges/clips may snap to."""
+        """Clip edges on every lane (and 0) that dragged edges/clips may snap to."""
         ex = set(exclude)
         pts = {0.0}
-        for s in self.segments + self.audio:
+        for s in self.all_segments():
             if s.id not in ex:
                 pts.add(s.timeline_start)
                 pts.add(s.timeline_end)
@@ -292,10 +472,20 @@ class Timeline:
 
     # --------------------------------------------------------------- operations
     def append_source(self, source: MediaSource) -> Segment:
-        """Add a whole source as a new segment at the end of the timeline."""
+        """Add a whole source as a new segment on V1 at the end of the timeline."""
         self.sources[source.id] = source
         seg = Segment(new_id(), source.id, 0.0, source.duration, self.duration)
         self.segments.append(seg)
+        return seg
+
+    def place_source(self, source: MediaSource, track: int, start: float) -> Segment:
+        """Put a whole source on a video track at ``start`` (or the nearest free slot)."""
+        lane = self.track(track)
+        at = self.fit_start(track, start, source.duration)
+        self.sources[source.id] = source
+        seg = Segment(new_id(), source.id, 0.0, source.duration, at, layer=track)
+        lane.append(seg)
+        self._sort()
         return seg
 
     def split(self, segment_id: str, t: float) -> tuple[Segment, Segment]:
@@ -306,10 +496,8 @@ class Timeline:
         if cut - seg.source_in < min_d or seg.source_out - cut < min_d:
             raise EditError("The playhead must be inside the clip to split it.")
         mid = seg.crop_x_at(cut)
-        right = Segment(new_id(), seg.source_id, cut, seg.source_out, seg.to_timeline(cut),
-                        seg.muted, track=seg.track,
-                        crop_x=mid if seg.crop_x_end is not None else seg.crop_x,
-                        crop_x_end=seg.crop_x_end)
+        right = replace(seg, id=new_id(), source_in=cut, timeline_start=seg.to_timeline(cut),
+                        crop_x=mid if seg.crop_x_end is not None else seg.crop_x)
         if seg.crop_x_end is not None:
             seg.crop_x_end = mid
         seg.source_out = cut
@@ -317,9 +505,9 @@ class Timeline:
         return seg, right
 
     def delete(self, segment_ids: Iterable[str], ripple: bool = False) -> None:
-        """Remove segments. With ``ripple`` later segments move left to close each gap."""
+        """Remove segments. With ``ripple`` later segments on the same lane move left."""
         ids = set(segment_ids)
-        if not ids or not ids.issubset({s.id for s in self.segments + self.audio}):
+        if not ids or not ids.issubset({s.id for s in self.all_segments()}):
             raise EditError("Select a clip to delete.")
 
         def prune(lane: list[Segment]) -> list[Segment]:
@@ -333,7 +521,7 @@ class Timeline:
                     kept.append(s)
             return kept
 
-        self.segments = prune(self.segments)
+        self.video_tracks = [prune(lane) for lane in self.video_tracks]
         self.audio = prune(self.audio)
 
     def trim_start(self, segment_id: str, new_start: float) -> float:
@@ -384,11 +572,11 @@ class Timeline:
         return seg.timeline_end
 
     def reorder(self, segment_id: str, new_index: int) -> None:
-        """Move a clip to position ``new_index`` in the segment order.
+        """Move a clip to position ``new_index`` in the order of its own lane.
 
         The clip is lifted out (its old slot closes) and dropped in front of the
         clip currently at ``new_index``; everything from there on shifts right by
-        the moved clip's duration. Gaps elsewhere on the timeline are preserved.
+        the moved clip's duration. Gaps elsewhere on the lane are preserved.
         """
         seg = self.get(segment_id)
         lane = self.lane_of(segment_id)
@@ -409,13 +597,28 @@ class Timeline:
         rest.insert(new_index, seg)
         lane[:] = rest
 
-    def move_to(self, segment_id: str, new_start: float) -> float:
-        """Slide a clip along the timeline to start at ``new_start`` without changing its
-        order: it is clamped between the end of the previous clip (or 0) and the start of
-        the next one, so it can be pulled left into a gap or pushed right into free space.
+    def move_to(self, segment_id: str, new_start: float, track: Optional[int] = None) -> float:
+        """Move a clip to start at ``new_start``.
+
+        Without ``track`` the clip slides along its own lane without changing its order:
+        it is clamped between the end of the previous clip (or 0) and the start of the
+        next one. With ``track`` it is placed freely on that video track (which may be the
+        one it is on) at ``new_start`` or, if that would overlap, the nearest free slot.
         Returns the applied start; raises ``EditError`` if nothing would change."""
         seg = self.get(segment_id)
         lane = self.lane_of(segment_id)
+        if track is not None:
+            if seg.is_audio:
+                raise EditError("Audio clips stay on the audio lane.")
+            target = self.track(track)
+            applied = self.fit_start(track, new_start, seg.duration, exclude=[seg.id])
+            if target is lane and abs(applied - seg.timeline_start) < EPS:
+                raise EditError("The clip is already there.")
+            lane[:] = [s for s in lane if s.id != seg.id]
+            seg.timeline_start = applied
+            target.append(seg)
+            self._sort()
+            return applied
         i = self.index_of(segment_id)
         lo = lane[i - 1].timeline_end if i > 0 else 0.0
         hi = (lane[i + 1].timeline_start - seg.duration
@@ -440,7 +643,7 @@ class Timeline:
         ids = set(segment_ids)
         if not ids:
             raise EditError("Select a clip first.")
-        for s in self.segments + self.audio:
+        for s in self.all_segments():
             if s.id in ids:
                 s.muted = muted
 
@@ -453,16 +656,15 @@ class Timeline:
         Returns the new audio clips.
         """
         ids = set(segment_ids)
-        videos = [s for s in self.segments if s.id in ids]
+        videos = [s for s in self.video_segments() if s.id in ids]
         if not videos:
             raise EditError("Select a video clip to detach its audio.")
-        todo = []
+        todo: list[Segment] = []
         for v in videos:
             src = self.sources.get(v.source_id)
             if src is not None and not src.has_audio:
                 continue
-            if any(a.timeline_start < v.timeline_end - EPS and a.timeline_end > v.timeline_start + EPS
-                   for a in self.audio):
+            if any(_overlaps(v.timeline_start, v.timeline_end, a) for a in self.audio + todo):
                 continue                         # something already sits on the audio lane there
             todo.append(v)
         if not todo:
@@ -479,7 +681,7 @@ class Timeline:
     def set_crop(self, segment_ids: Iterable[str], x: float, x_end: Optional[float] = None) -> None:
         """Set the reframe crop position (0..1) on video clips; ``x_end`` makes it pan."""
         ids = set(segment_ids)
-        targets = [s for s in self.segments if s.id in ids]
+        targets = [s for s in self.video_segments() if s.id in ids]
         if not targets:
             raise EditError("Select a video clip to reframe.")
         x = _unit(x, 0.5)
@@ -492,28 +694,55 @@ class Timeline:
         for s in targets:
             s.crop_x, s.crop_x_end = x, x_end
 
-    def close_gaps(self) -> None:
-        """Pack all segments left so the timeline has no gaps."""
-        if not self.gaps():
+    def set_transform(self, segment_ids: Iterable[str], x: Optional[float] = None,
+                      y: Optional[float] = None, scale: Optional[float] = None,
+                      opacity: Optional[float] = None) -> None:
+        """Set position / scale / opacity of overlay clips (``None`` keeps a value)."""
+        ids = set(segment_ids)
+        targets = [s for s in self.video_segments() if s.id in ids and s.layer > 0]
+        if not targets:
+            raise EditError("Select a clip on an overlay track to transform it.")
+        wanted = []
+        for s in targets:
+            wanted.append((
+                s.pos_x if x is None else _clamped(x, s.pos_x, -POS_LIMIT, POS_LIMIT),
+                s.pos_y if y is None else _clamped(y, s.pos_y, -POS_LIMIT, POS_LIMIT),
+                s.scale if scale is None else _clamped(scale, s.scale, SCALE_MIN, SCALE_MAX),
+                s.opacity if opacity is None else _unit(opacity, s.opacity),
+            ))
+        if all(max(abs(a - b) for a, b in zip(w, (s.pos_x, s.pos_y, s.scale, s.opacity))) < 1e-9
+               for s, w in zip(targets, wanted)):
+            raise EditError("The clip already looks like that.")
+        for s, w in zip(targets, wanted):
+            s.pos_x, s.pos_y, s.scale, s.opacity = w
+
+    def close_gaps(self, track: int = 0) -> None:
+        """Pack all segments of one video track left so it has no gaps."""
+        if not self.gaps(track):
             raise EditError("There are no gaps to close.")
         cursor = 0.0
-        for s in self.segments:
+        for s in self.track(track):
             s.timeline_start = cursor
             cursor = s.timeline_end
 
     def validate(self) -> None:
         """Raise ``EditError`` if the invariants (order, no overlap, bounds) are broken."""
-        prev_end = 0.0
-        for s in self.segments:
-            if s.duration <= 0:
-                raise EditError(f"Segment {s.id} has no duration")
-            if s.source_in < -EPS:
-                raise EditError(f"Segment {s.id} starts before its source")
-            if s.source_out > self._source_duration(s) + 1e-3:
-                raise EditError(f"Segment {s.id} runs past the end of its source")
-            if s.timeline_start < prev_end - 1e-4:
-                raise EditError(f"Segment {s.id} overlaps the previous clip")
-            prev_end = s.timeline_end
+        if not self.video_tracks:
+            raise EditError("The timeline has no base track")
+        for index, lane in enumerate(self.video_tracks):
+            prev_end = 0.0
+            for s in lane:
+                if s.is_audio or s.layer != index:
+                    raise EditError(f"Segment {s.id} is on the wrong track")
+                if s.duration <= 0:
+                    raise EditError(f"Segment {s.id} has no duration")
+                if s.source_in < -EPS:
+                    raise EditError(f"Segment {s.id} starts before its source")
+                if s.source_out > self._source_duration(s) + 1e-3:
+                    raise EditError(f"Segment {s.id} runs past the end of its source")
+                if s.timeline_start < prev_end - 1e-4:
+                    raise EditError(f"Segment {s.id} overlaps the previous clip")
+                prev_end = s.timeline_end
         prev_end = 0.0
         for s in self.audio:
             if s.duration <= 0:

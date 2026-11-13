@@ -1184,3 +1184,27 @@ def test_old_project_dict_without_crop_loads():
     d = {"id": "a", "source_id": "s", "source_in": 0, "source_out": 1, "timeline_start": 0}
     seg = Segment.from_dict(d)
     assert seg.crop_x == 0.5 and seg.crop_x_end is None
+
+
+# ------------------------------------------------- base track among layered tracks
+def test_single_track_timeline_is_one_base_track():
+    tl = make(("a", 10.0), ("b", 5.0))
+    assert tl.track_count == 1 and tl.tracks == [tl.segments]
+    assert all(s.layer == 0 and not s.is_overlay for s in tl.segments)
+    assert tl.all_segments() == tl.segments == tl.video_segments()
+    assert tl.snapshot().track_count == 1
+
+
+def test_base_track_edits_ignore_overlay_tracks():
+    tl = make(("a", 10.0), ("b", 5.0))
+    tl.add_track()
+    over = tl.place_source(src("o", 6.0), 1, 7.0)            # spans the a/b cut on V2
+    a, b = tl.segments
+    tl.split(a.id, 4.0)
+    tl.delete([tl.segments[1].id], ripple=True)              # drop a[4-10]; b ripples left
+    assert [(s.source_id, s.timeline_start) for s in tl.segments] == [("a", 0.0), ("b", 4.0)]
+    assert (over.timeline_start, over.layer) == (7.0, 1)     # the overlay did not move
+    tl.trim_end(b.id, 6.0)
+    assert tl.gaps() == [] and tl.duration == pytest.approx(13.0)
+    assert tl.segment_at(8.0) is None and tl.segments_at(8.0) == [over]
+    check(tl)

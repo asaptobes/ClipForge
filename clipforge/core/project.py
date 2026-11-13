@@ -16,11 +16,13 @@ from typing import Optional
 
 from .captions import (CaptionLine, CaptionStyle, lines_from_dicts, lines_to_dicts)
 from .history import History
-from .model import ExportSettings, MediaSource, Segment, Timeline
+from .model import (MAX_VIDEO_TRACKS, ExportSettings, MediaSource, Segment, Timeline,
+                    TimelineSnapshot)
 
 PROJECT_EXTENSION = ".clipforge"
 FORMAT_NAME = "clipforge-project"
-FORMAT_VERSION = 1
+#: 2 added layered video tracks ("video_tracks" and per-clip layer/transform keys).
+FORMAT_VERSION = 2
 
 
 class ProjectError(Exception):
@@ -70,6 +72,7 @@ class Project:
             "format": FORMAT_NAME,
             "version": FORMAT_VERSION,
             "sources": sources,
+            "video_tracks": self.timeline.track_count,
             "segments": [s.to_dict() for s in self.timeline.all_segments()],
             "playhead": self.playhead,
             "export": self.export.to_dict(),
@@ -131,7 +134,8 @@ class Project:
                 sources[src.id] = src
             segments = [Segment.from_dict(s) for s in data.get("segments", [])]
             segments = [s for s in segments if s.source_id in sources]
-            project = cls(sources=sources, timeline=Timeline(sources, segments),
+            tracks = min(max(1, int(data.get("video_tracks", 1))), MAX_VIDEO_TRACKS)
+            project = cls(sources=sources, timeline=Timeline(sources, segments, tracks),
                           export=ExportSettings.from_dict(data.get("export", {})),
                           playhead=float(data.get("playhead", 0.0)), path=path,
                           captions=lines_from_dicts(data.get("captions")),
@@ -140,12 +144,14 @@ class Project:
             project.history.load_dict(data.get("history", {}))
             for entry in project.history.undo_stack + project.history.redo_stack:
                 # same rule as for the live timeline: never keep clips of unknown media
-                entry.segments = [s for s in entry.segments if s.source_id in sources]
+                entry.segments = TimelineSnapshot(
+                    (s for s in entry.segments if s.source_id in sources),
+                    entry.segments.track_count)
             project.timeline.validate()
             # keep the playhead inside the timeline (NaN/negative/too large -> clamped)
             ph = project.playhead
             project.playhead = min(max(0.0, ph), project.timeline.duration) if ph == ph else 0.0
-        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise ProjectError(f"The project file is damaged: {exc}") from exc
         return project
 

@@ -287,6 +287,9 @@ def can_fast_export(sources: dict[str, MediaSource], segments: Sequence[Segment]
                        "video to be re-framed and re-encoded.")
     if settings.captions and captions:
         return False, "Captions are burned into the picture, which needs the video to be re-encoded."
+    if any(s.is_overlay for s in segments):
+        return False, ("The timeline has clips on overlay tracks, which have to be composited "
+                       "over the base track, so the export is re-encoded.")
     if any(s.is_audio for s in segments):
         return False, ("The timeline has detached audio clips, which have to be mixed into "
                        "the sound, so the export is re-encoded.")
@@ -386,15 +389,20 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
     ``video_encoder`` overrides ``ffmpeg.pick_video_encoder`` (used by tests).
     ``captions`` (timeline-time lines) are burned in with ``caption_style`` (default: the
     "pop" preset) when ``settings.captions`` is on; this forces accurate mode.
+    ``segments`` may hold every lane (V1, overlay tracks ``layer >= 1``, detached audio):
+    overlay clips are composited over V1 per the multi-track contract and force accurate mode.
     Raises ``MediaError`` for an empty timeline or missing source files."""
     everything = _ordered(segments)
-    segs = [s for s in everything if not s.is_audio]
+    segs = [s for s in everything if not s.is_audio and not s.is_overlay]
     asegs = [s for s in everything if s.is_audio]
+    osegs = sorted((s for s in everything if s.is_overlay),
+                   key=lambda s: (s.layer, s.timeline_start))
     if not everything:
         raise MediaError("There is nothing to export.")
     used: list[MediaSource] = []
     aused: list[MediaSource] = []
-    for lane, bucket in ((segs, used), (asegs, aused)):
+    oused: list[MediaSource] = []
+    for lane, bucket in ((segs, used), (asegs, aused), (osegs, oused)):
         for s in lane:
             src = sources.get(s.source_id)
             if src is None:
@@ -409,7 +417,7 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
     out_path = output_path_for(settings)
     ctx = dict(sources=sources, segs=segs, used=used, settings=settings, temp_dir=temp_dir,
                uid=uid, out_path=out_path)
-    acc = dict(asegs=asegs, aused=aused, video_encoder=video_encoder,
+    acc = dict(asegs=asegs, aused=aused, osegs=osegs, oused=oused, video_encoder=video_encoder,
                captions=list(captions) if settings.captions else [],
                caption_style=caption_style)
 
@@ -650,9 +658,40 @@ def _reframe_chain(idx: int, label: str, d: str, seg: Segment, src: MediaSource,
     return f"{src_in}{head},{crop},scale={width}:{height},{tail}[{label}]"
 
 
+def _overlay_size(o: Segment, src: MediaSource, width: int, height: int) -> tuple[int, int]:
+    """Rendered ``(w, h)`` of an overlay clip: ``scale * canvas width``, source aspect kept."""
+    ow = _even_near(max(0.05, o.scale) * width)
+    aspect = src.width / src.height if src.width > 0 and src.height > 0 else width / height
+    return ow, _even_near(ow / aspect)
+
+
+def _overlay_xy(o: Segment, src: MediaSource, width: int, height: int) -> tuple[int, int]:
+    """Top-left corner of an overlay clip so its centre sits at the contract position."""
+    ow, oh = _overlay_size(o, src, width, height)
+    return (int(round(width * (0.5 + o.pos_x) - ow / 2)),
+            int(round(height * (0.5 + o.pos_y) - oh / 2)))
+
+
+def _overlay_chain(idx: int, label: str, o: Segment, src: MediaSource, width: int, height: int,
+                   fps_e: str, shift: float) -> str:
+    """Filter chain turning input ``idx`` into a scaled, faded overlay picture whose
+    timestamps start at ``shift`` seconds (its place on the output timeline)."""
+    ow, oh = _overlay_size(o, src, width, height)
+    opacity = min(1.0, max(0.0, o.opacity))
+    chain = (f"[{idx}:v:0]trim=duration={_fmt(o.duration)},setpts=PTS-STARTPTS,"
+             f"fps={fps_e},scale={ow}:{oh},setsar=1,")
+    if opacity < 0.999:
+        chain += f"format=yuva420p,colorchannelmixer=aa={_fmt(opacity)},"
+    else:
+        chain += "format=yuv420p,"
+    return f"{chain}setpts=PTS+{_fmt(shift)}/TB[{label}]"
+
+
 def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, reason,
-                   video_encoder, asegs=(), aused=(), captions=(), caption_style=None) -> ExportPlan:
-    ref = used or list(aused)                # picture format comes from the video lane
+                   video_encoder, asegs=(), aused=(), osegs=(), oused=(), captions=(),
+                   caption_style=None) -> ExportPlan:
+    # picture format comes from V1, else the lowest overlay track, else the audio
+    ref = used or list(oused) or list(aused)
     width, height = resolve_output_size(ref, settings)
     fps = _output_fps(ref, settings)
     fps_e = _fps_expr(fps)
@@ -681,9 +720,9 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
     # Audio clips that actually make sound (not muted, source has an audio stream).
     sounding = ([(a, src) for a, src in zip(asegs, aused) if not a.muted and src.has_audio]
                 if with_audio else [])
-    starts = [s.timeline_start for s in list(segs) + list(asegs)]
-    origin = min(starts)
-    timeline_end = max(s.timeline_end for s in list(segs) + list(asegs))
+    everyone = list(segs) + list(asegs) + list(osegs)
+    origin = min(s.timeline_start for s in everyone)
+    timeline_end = max(s.timeline_end for s in everyone)
     cursor = origin
     total = 0.0
     piece = 0
@@ -740,17 +779,36 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
             labels.append(f"[a{i}]")
         total += dur
 
-    if asegs:                                # audio (or picture) ending the timeline later
+    if asegs or osegs:                       # audio / overlays ending the timeline later
         tail = timeline_end - cursor
         if tail > max(_GAP_EPS, 0.5 / fps):
             add_gap(tail)
 
     n = piece
-    vlabel = "[va]" if sounding else "[outa]"
-    concat = (f"{''.join(labels)}concat=n={n}:v=1:a={1 if with_audio else 0}[outv]"
+    base_v = "[base]" if osegs else "[outv]"
+    ov_chains: list[str] = []
+    ov_audio: list[tuple[Segment, int]] = []
+    prev = "[base]"
+    for k, (o, src) in enumerate(zip(osegs, oused)):
+        idx = sum(1 for x in inputs if x == "-i")
+        if o.source_in > 0:
+            inputs += ["-ss", _fmt(o.source_in)]
+        inputs += ["-t", _fmt(o.duration), "-i", src.path]
+        t0 = o.timeline_start - origin
+        ov_chains.append(_overlay_chain(idx, f"o{k}", o, src, width, height, fps_e, t0))
+        out = "[outv]" if k == len(osegs) - 1 else f"[m{k}]"
+        ox, oy = _overlay_xy(o, src, width, height)
+        ov_chains.append(f"{prev}[o{k}]overlay=x={ox}:y={oy}:eof_action=pass:"
+                         f"enable='between(t,{_fmt(t0)},{_fmt(t0 + o.duration)})'{out}")
+        prev = out
+        if with_audio and src.has_audio and not o.muted:
+            ov_audio.append((o, idx))
+    mix_count = len(sounding) + len(ov_audio)
+    vlabel = "[va]" if mix_count else "[outa]"
+    concat = (f"{''.join(labels)}concat=n={n}:v=1:a={1 if with_audio else 0}{base_v}"
               + (vlabel if with_audio else ""))
     tail_chains: list[str] = []
-    if sounding:
+    if mix_count:
         mix_in = [vlabel]
         for k, (a, src) in enumerate(sounding):
             idx = sum(1 for x in inputs if x == "-i")
@@ -760,6 +818,10 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
             tail_chains.append(_audio_clip_chain(idx, f"ac{k}", _fmt(a.duration),
                                                  a.timeline_start - origin))
             mix_in.append(f"[ac{k}]")
+        for k, (o, idx) in enumerate(ov_audio):
+            tail_chains.append(_audio_clip_chain(idx, f"ao{k}", _fmt(o.duration),
+                                                 o.timeline_start - origin))
+            mix_in.append(f"[ao{k}]")
         td = _fmt(total)
         tail_chains.append(
             f"{''.join(mix_in)}amix=inputs={len(mix_in)}:duration=longest:normalize=0,"
@@ -786,7 +848,7 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
             opts += f":fontsdir={_filter_path(fonts)}"
         caption_chain = [f"[outv]ass={opts}[outvc]"]
         video_label = "[outvc]"
-    graph = ";".join(chains + [concat] + caption_chain + tail_chains)
+    graph = ";".join(chains + [concat] + ov_chains + caption_chain + tail_chains)
 
     out_args = ["-map", video_label]
     if with_audio:

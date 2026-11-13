@@ -1,7 +1,7 @@
 """Snapshot-based undo/redo history for the timeline.
 
 Segments are tiny value objects, so each history entry simply stores the full
-segment list as it was *before* the edit. That makes undo/redo exact for every
+segment list (and the number of video tracks) as it was *before* the edit. That makes undo/redo exact for every
 operation, including ones added later, with no per-operation inverse logic.
 """
 
@@ -9,20 +9,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .model import Segment
+from .model import MAX_VIDEO_TRACKS, Segment, TimelineSnapshot
+
+
+def _copy(snapshot: list[Segment]) -> TimelineSnapshot:
+    """Deep copy that keeps the track count of a ``TimelineSnapshot`` (a plain list of
+    clips gets as many tracks as its highest layer needs)."""
+    return TimelineSnapshot((s.copy() for s in snapshot), getattr(snapshot, "track_count", 1))
 
 
 @dataclass
 class HistoryEntry:
     label: str
-    segments: list[Segment]
+    segments: TimelineSnapshot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segments, TimelineSnapshot):
+            self.segments = TimelineSnapshot(self.segments)
 
     def to_dict(self) -> dict:
-        return {"label": self.label, "segments": [s.to_dict() for s in self.segments]}
+        return {"label": self.label, "tracks": self.segments.track_count,
+                "segments": [s.to_dict() for s in self.segments]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "HistoryEntry":
-        return cls(d.get("label", "Edit"), [Segment.from_dict(s) for s in d.get("segments", [])])
+        try:
+            tracks = min(max(1, int(d.get("tracks", 1))), MAX_VIDEO_TRACKS)
+        except (TypeError, ValueError, OverflowError):
+            tracks = 1
+        return cls(d.get("label", "Edit"),
+                   TimelineSnapshot((Segment.from_dict(s) for s in d.get("segments", [])), tracks))
 
 
 class History:
@@ -33,7 +49,7 @@ class History:
 
     def record(self, label: str, before: list[Segment]) -> None:
         """Register a completed edit; ``before`` is the pre-edit snapshot."""
-        self.undo_stack.append(HistoryEntry(label, [s.copy() for s in before]))
+        self.undo_stack.append(HistoryEntry(label, _copy(before)))
         excess = len(self.undo_stack) - max(0, self.limit)
         if excess > 0:                      # (a plain [:-limit] slice breaks for limit == 0)
             del self.undo_stack[:excess]
@@ -54,12 +70,12 @@ class History:
     def undo(self, current: list[Segment]) -> HistoryEntry:
         """Pop the last edit. ``current`` is saved so it can be redone."""
         entry = self.undo_stack.pop()
-        self.redo_stack.append(HistoryEntry(entry.label, [s.copy() for s in current]))
+        self.redo_stack.append(HistoryEntry(entry.label, _copy(current)))
         return entry
 
     def redo(self, current: list[Segment]) -> HistoryEntry:
         entry = self.redo_stack.pop()
-        self.undo_stack.append(HistoryEntry(entry.label, [s.copy() for s in current]))
+        self.undo_stack.append(HistoryEntry(entry.label, _copy(current)))
         return entry
 
     def clear(self) -> None:
