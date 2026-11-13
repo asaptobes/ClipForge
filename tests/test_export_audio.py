@@ -17,7 +17,7 @@ from clipforge.media.export import ExportJob, build_plan, can_fast_export
 
 
 def aseg(src, a, b, start, muted=False) -> Segment:
-    return Segment(uuid.uuid4().hex[:12], src.id, a, b, start, muted, "audio")
+    return Segment(uuid.uuid4().hex[:12], src.id, a, b, start, muted, track="audio")
 
 
 def vmuted(src, a, b, start) -> Segment:

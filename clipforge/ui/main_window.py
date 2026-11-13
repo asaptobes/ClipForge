@@ -8,7 +8,8 @@ from typing import Callable, Optional, Sequence
 
 from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMenu,
+from PySide6.QtWidgets import (QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+                               QMenu,
                                QMessageBox, QSplitter, QToolButton, QVBoxLayout, QWidget)
 
 from .. import __app_name__, paths
@@ -22,6 +23,7 @@ from ..media.waveform import WaveformProvider
 from ..settings import Settings
 from ..workers import Task
 from . import icons, theme
+from .captions_dialog import CaptionsDialog
 from .export_dialog import ExportDialog
 from .left_panel import LeftPanel
 from .preview import PreviewPanel
@@ -29,6 +31,12 @@ from .settings_dialog import SettingsDialog
 from .timeline import TimelinePanel, can_detach_audio
 
 log = logging.getLogger(__name__)
+
+CANVAS_ITEMS = [("source", "Original"), ("9:16", "9:16 Vertical"), ("4:5", "4:5 Portrait"),
+                ("1:1", "1:1 Square"), ("16:9", "16:9 Wide")]
+FILL_ITEMS = [("fill", "Crop"), ("blur", "Blur"), ("fit", "Bars")]
+FILL_TIPS = {"fill": "Crop the picture to fill the canvas", "blur": "Fit the picture over a blurred "
+             "copy of itself", "fit": "Fit the whole picture with black bars"}
 
 VIDEO_FILTER = "Video files (*.mp4 *.mov *.mkv *.webm *.m4v);;All files (*.*)"
 PROJECT_FILTER = f"ClipForge project (*{PROJECT_EXTENSION})"
@@ -44,9 +52,10 @@ class MainWindow(QMainWindow):
         self._tasks: set[Task] = set()
         self._import_count = 0
         self._closing = False
+        self._captions_dialog: Optional[CaptionsDialog] = None
 
         self.setWindowTitle(__app_name__)
-        self.setMinimumSize(1100, 680)
+        self.setMinimumSize(1160, 680)
         self.resize(1480, 900)
         self.setAcceptDrops(True)
         icon_file = paths.resource_path("icon.ico")
@@ -59,6 +68,7 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
         self._refresh_title()
         self._refresh_actions()
+        self._sync_canvas()
         QTimer.singleShot(0, self._check_dependencies)
 
     # ------------------------------------------------------------------ build
@@ -154,6 +164,8 @@ class MainWindow(QMainWindow):
         self.act_import = a("Import Video", self.import_dialog, ["Ctrl+I"], "import")
         self.act_settings = a("Settings", self.open_settings, ["Ctrl+,"], "settings")
         self.act_export = a("Export", self.open_export, ["Ctrl+E"], "export")
+        self.act_captions = a("Captions", self.open_captions, ["Ctrl+Shift+C"], "captions",
+                              "Generate, edit and style captions")
         self.act_export_audio = a("Export audio only…", self.export_audio, ["Ctrl+Shift+E"], None,
                                   "Save the sound of the selected clips (or the whole timeline) "
                                   "as mp3, m4a or wav")
@@ -176,7 +188,16 @@ class MainWindow(QMainWindow):
         self.act_next_frame = a("Next frame", lambda: pv.step_frames(1), ["Right"])
         self.act_prev_10 = a("Back 10 frames", lambda: pv.step_frames(-10), ["Shift+Left"])
         self.act_next_10 = a("Forward 10 frames", lambda: pv.step_frames(10), ["Shift+Right"])
-        self.act_j = a("Shuttle back", lambda: pv.shuttle(-1), ["J"])
+        # Alt-modified: Qt matches modifiers exactly, so plain Left/Right frame steps stay apart
+        self.act_nudge_left = a("Nudge crop left", lambda: pv.nudge_crop(-1), ["Alt+Left"], None,
+                                "Move the crop window left by 2%")
+        self.act_nudge_right = a("Nudge crop right", lambda: pv.nudge_crop(1), ["Alt+Right"], None,
+                                 "Move the crop window right by 2%")
+        self.act_nudge_left_big = a("Nudge crop left (big)", lambda: pv.nudge_crop(-1, big=True),
+                                    ["Alt+Shift+Left"], None, "Move the crop window left by 10%")
+        self.act_nudge_right_big = a("Nudge crop right (big)", lambda: pv.nudge_crop(1, big=True),
+                                     ["Alt+Shift+Right"], None, "Move the crop window right by 10%")
+        self.act_j = a("Shuttle back",lambda: pv.shuttle(-1), ["J"])
         self.act_k = a("Shuttle stop", lambda: pv.shuttle(0), ["K"])
         self.act_l = a("Shuttle forward", lambda: pv.shuttle(1), ["L"])
         self.act_home = a("Go to start", pv.go_to_start, ["Home"])
@@ -220,9 +241,9 @@ class MainWindow(QMainWindow):
                 b.setProperty("variant", "primary")
             return b
 
-        self.btn_new = button(self.act_new)
-        self.btn_open = button(self.act_open)
-        self.btn_save = button(self.act_save)
+        self.btn_new = button(self.act_new, text=False)
+        self.btn_open = button(self.act_open, text=False)
+        self.btn_save = button(self.act_save, text=False)
         save_menu = QMenu(self)
         save_menu.addAction(self.act_save)
         save_menu.addAction(self.act_save_as)
@@ -242,14 +263,42 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._vline())
         lay.addSpacing(8)
         lay.addWidget(self.btn_import)
+        lay.addSpacing(8)
+        lay.addWidget(self._vline())
+        lay.addSpacing(8)
+
+        canvas_label = QLabel("Canvas")
+        canvas_label.setProperty("role", "dim")
+        self.canvas_combo = QComboBox()
+        for key, text in CANVAS_ITEMS:
+            self.canvas_combo.addItem(text, key)
+        self.canvas_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.canvas_combo.setToolTip("Shape of the exported video and the preview")
+        self.fill_combo = QComboBox()
+        for key, text in FILL_ITEMS:
+            self.fill_combo.addItem(text, key)
+            self.fill_combo.setItemData(self.fill_combo.count() - 1, FILL_TIPS[key],
+                                        Qt.ItemDataRole.ToolTipRole)
+        self.fill_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.fill_combo.setToolTip("How clips fill a canvas that is not their shape")
+        lay.addWidget(canvas_label)
+        lay.addSpacing(4)
+        lay.addWidget(self.canvas_combo)
+        lay.addWidget(self.fill_combo)
+        lay.addSpacing(6)
+        self.btn_captions = button(self.act_captions)
+        lay.addWidget(self.btn_captions)
+        self.canvas_combo.activated.connect(self._on_canvas_picked)
+        self.fill_combo.activated.connect(self._on_canvas_picked)
 
         lay.addStretch(1)
         self.project_label = QLabel("Untitled")
+        self.project_label.setMinimumWidth(0)
         self.project_label.setProperty("role", "dim")
         lay.addWidget(self.project_label)
         lay.addStretch(1)
 
-        self.btn_settings = button(self.act_settings)
+        self.btn_settings = button(self.act_settings, text=False)
         lay.addWidget(self.btn_settings)
         lay.addSpacing(6)
         self.act_export.setIcon(icons.icon("export", theme.current().accent_text))
@@ -272,6 +321,8 @@ class MainWindow(QMainWindow):
         d.selectionChanged.connect(self._refresh_actions)
         d.playheadChanged.connect(self._refresh_actions)
         d.message.connect(self.show_status)
+        d.canvasChanged.connect(self._sync_canvas)
+        d.projectReset.connect(self._close_captions)
         self.left_panel.downloadFinished.connect(self._on_download_finished)
         self.left_panel.importRequested.connect(self.import_dialog)
         self.left_panel.relinkRequested.connect(self.relink_source)
@@ -294,10 +345,26 @@ class MainWindow(QMainWindow):
         self.project_label.setToolTip(self.document.path or "Project not saved yet")
         self.setWindowTitle(f"{name}{'*' if dirty else ''} — {__app_name__}")
 
+    def _on_canvas_picked(self, _index: int = 0) -> None:
+        self.document.set_canvas(aspect=str(self.canvas_combo.currentData()),
+                                 reframe=str(self.fill_combo.currentData()))
+
+    def _sync_canvas(self) -> None:
+        """Show the document's canvas in the top bar (it also changes from the Export dialog)."""
+        for box, key in ((self.canvas_combo, self.document.aspect),
+                         (self.fill_combo, self.document.reframe_mode)):
+            i = box.findData(key)
+            if i >= 0 and box.currentIndex() != i:
+                box.blockSignals(True)
+                box.setCurrentIndex(i)
+                box.blockSignals(False)
+        self.fill_combo.setVisible(self.document.aspect != "source")
+
     def _refresh_actions(self) -> None:
         has_clips = not self.document.timeline.is_empty()
         self.act_export.setEnabled(has_clips)
         self.act_detach.setEnabled(can_detach_audio(self.document))
+        self.act_captions.setEnabled(has_clips)
 
     def _check_dependencies(self) -> None:
         try:
@@ -586,6 +653,37 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
+    def open_captions(self) -> None:
+        """Show the (single, non-modal) Captions window, or bring it to the front."""
+        dlg = self._captions_dialog
+        if dlg is not None:
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        if self.document.timeline.is_empty():
+            self.show_status("Add a clip to the timeline before making captions.")
+            return
+        dlg = CaptionsDialog(self.document, self.settings, self)
+        dlg.finished.connect(self._on_captions_closed)
+        self._captions_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def captions_dialog(self) -> Optional[CaptionsDialog]:
+        return self._captions_dialog
+
+    def _on_captions_closed(self, _result: int = 0) -> None:
+        dlg, self._captions_dialog = self._captions_dialog, None
+        if dlg is not None:
+            dlg.deleteLater()
+
+    def _close_captions(self) -> None:
+        """A different project is loading: the captions window would show stale state."""
+        if self._captions_dialog is not None:
+            self._captions_dialog.close()
+
     def export_audio(self) -> None:
         """Save the sound of the selection (or the whole timeline) as an audio file."""
         import os
@@ -714,6 +812,8 @@ class MainWindow(QMainWindow):
         self._save_window_state()
         for task in list(self._tasks):
             task.cancel()
+        if self._captions_dialog is not None:
+            self._captions_dialog.close()
         for closer in (self.preview.shutdown, self.left_panel.shutdown,
                        self.thumbnails.shutdown, self.waveforms.shutdown):
             try:

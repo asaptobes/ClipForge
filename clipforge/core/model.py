@@ -30,6 +30,14 @@ def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _unit(value, default: float) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(v, 0.0), 1.0) if v == v else default
+
+
 @dataclass
 class MediaSource:
     """An imported or downloaded media file. Never modified on disk."""
@@ -84,6 +92,11 @@ class Segment:
     source_out: float
     timeline_start: float
     muted: bool = False
+    #: Horizontal crop position for vertical/square reframing: 0 = left edge of the source
+    #: frame, 0.5 = centre, 1 = right edge. If ``crop_x_end`` is set the crop pans linearly
+    #: from ``crop_x`` (clip start) to ``crop_x_end`` (clip end).
+    crop_x: float = 0.5
+    crop_x_end: Optional[float] = None
     #: Which lane the clip lives on: "video" (picture + its own sound) or "audio"
     #: (a detached sound-only clip). Both lanes use the same fields and rules.
     track: str = "video"
@@ -107,6 +120,13 @@ class Segment:
     def to_source(self, t: float) -> float:
         return self.source_in + (t - self.timeline_start)
 
+    def crop_x_at(self, source_time: float) -> float:
+        """Crop position at a source time inside this clip (linear pan, clamped to 0..1)."""
+        if self.crop_x_end is None or self.duration <= 0:
+            return min(max(self.crop_x, 0.0), 1.0)
+        f = min(max((source_time - self.source_in) / self.duration, 0.0), 1.0)
+        return min(max(self.crop_x + (self.crop_x_end - self.crop_x) * f, 0.0), 1.0)
+
     def to_timeline(self, source_time: float) -> float:
         return self.timeline_start + (source_time - self.source_in)
 
@@ -126,6 +146,8 @@ class Segment:
             timeline_start=float(d["timeline_start"]),
             muted=bool(d.get("muted", False)),
             track="audio" if d.get("track") == "audio" else "video",
+            crop_x=_unit(d.get("crop_x", 0.5), 0.5),
+            crop_x_end=None if d.get("crop_x_end") is None else _unit(d.get("crop_x_end"), 0.5),
         )
 
 
@@ -283,8 +305,13 @@ class Timeline:
         min_d = self._frame(seg) - EPS
         if cut - seg.source_in < min_d or seg.source_out - cut < min_d:
             raise EditError("The playhead must be inside the clip to split it.")
-        right = Segment(new_id(), seg.source_id, cut, seg.source_out,
-                        seg.to_timeline(cut), seg.muted, seg.track)
+        mid = seg.crop_x_at(cut)
+        right = Segment(new_id(), seg.source_id, cut, seg.source_out, seg.to_timeline(cut),
+                        seg.muted, track=seg.track,
+                        crop_x=mid if seg.crop_x_end is not None else seg.crop_x,
+                        crop_x_end=seg.crop_x_end)
+        if seg.crop_x_end is not None:
+            seg.crop_x_end = mid
         seg.source_out = cut
         self.lane_of(seg.id).insert(self.index_of(seg.id) + 1, right)
         return seg, right
@@ -443,11 +470,27 @@ class Timeline:
         made = []
         for v in todo:
             made.append(Segment(new_id(), v.source_id, v.source_in, v.source_out,
-                                v.timeline_start, False, "audio"))
+                                v.timeline_start, False, track="audio"))
             v.muted = True
         self.audio.extend(made)
         self._sort()
         return made
+
+    def set_crop(self, segment_ids: Iterable[str], x: float, x_end: Optional[float] = None) -> None:
+        """Set the reframe crop position (0..1) on video clips; ``x_end`` makes it pan."""
+        ids = set(segment_ids)
+        targets = [s for s in self.segments if s.id in ids]
+        if not targets:
+            raise EditError("Select a video clip to reframe.")
+        x = _unit(x, 0.5)
+        x_end = None if x_end is None else _unit(x_end, x)
+        if all(abs(s.crop_x - x) < 1e-6 and
+               ((s.crop_x_end is None and x_end is None) or
+                (s.crop_x_end is not None and x_end is not None and abs(s.crop_x_end - x_end) < 1e-6))
+               for s in targets):
+            raise EditError("The crop is already there.")
+        for s in targets:
+            s.crop_x, s.crop_x_end = x, x_end
 
     def close_gaps(self) -> None:
         """Pack all segments left so the timeline has no gaps."""
@@ -497,6 +540,15 @@ class ExportSettings:
     hw_accel: str = "auto"         # "auto" | "on" | "off"
     mode: str = "auto"             # "auto" | "fast" | "accurate"
     scope: str = "timeline"        # "timeline" | "selection"
+    #: Output canvas shape. "source" keeps each source's own shape; otherwise the canvas is
+    #: this aspect ratio, with ``resolution`` (short side) setting its size.
+    aspect: str = "source"         # "source" | "9:16" | "4:5" | "1:1" | "16:9"
+    #: How a clip that is not the canvas shape is placed on it:
+    #: "fill" = crop to fill (see Segment.crop_x), "blur" = fit over a blurred copy,
+    #: "fit" = fit with black bars.
+    reframe: str = "fill"          # "fill" | "blur" | "fit"
+    captions: bool = True          # burn the project's captions into the export if present
+    preset: str = "custom"         # name of the export preset last chosen in the dialog
 
     def to_dict(self) -> dict:
         return asdict(self)

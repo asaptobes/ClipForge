@@ -357,7 +357,7 @@ LOGIN_TEXT = "needs a login or isn't public"
 
 def test_supported_sites_contract():
     assert SUPPORTED_SITES == {"youtube": "YouTube", "reddit": "Reddit", "tiktok": "TikTok",
-                               "instagram": "Instagram"}
+                               "instagram": "Instagram", "twitch": "Twitch", "kick": "Kick"}
 
 
 @pytest.mark.parametrize("url, expected", [
@@ -451,10 +451,10 @@ def test_rejection_text_lists_supported_sites():
         with pytest.raises(MediaError) as ei:
             validate_url(url)
         text = str(ei.value)
-        assert "Paste a video link from YouTube, Reddit, TikTok or Instagram" in text or (
+        assert "Paste a video link from YouTube, Reddit, TikTok, Instagram, Twitch or Kick" in text or (
             "Reddit" in text or "TikTok" in text or "Instagram" in text)
-    with pytest.raises(MediaError, match="Paste a video link from YouTube, Reddit, TikTok "
-                                         "or Instagram"):
+    with pytest.raises(MediaError, match="Paste a video link from YouTube, Reddit, TikTok, "
+                                         "Instagram, Twitch or Kick"):
         validate_url("https://vimeo.com/1")
 
 
@@ -728,7 +728,7 @@ def test_metadata_wrong_site_rejected_without_ytdlp(qtbot, fake):
     job = MetadataJob("https://reddit.com.evil.com/r/a/comments/abc123/")
     with qtbot.waitSignal(job.failed, timeout=5000) as sig:
         job.start()
-    assert "Paste a video link from YouTube, Reddit, TikTok or Instagram" in sig.args[0]
+    assert "Paste a video link from YouTube, Reddit, TikTok, Instagram, Twitch or Kick" in sig.args[0]
     assert not fake.instances
 
 

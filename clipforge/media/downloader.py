@@ -1,4 +1,4 @@
-"""Downloads (YouTube, Reddit, TikTok, Instagram public posts) through the public
+"""Downloads (YouTube, Reddit, TikTok, Instagram, Twitch and Kick public videos/clips) through the public
 ``yt_dlp`` Python API only.
 
 No cookies, no credentials, no DRM/anti-bot circumvention. Users are responsible for
@@ -10,14 +10,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+import tempfile
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from PySide6.QtCore import QObject, Signal
 
+from ..core.timecode import format_clock
 from . import MediaError, ffmpeg, ytdlp_update
 
 # A newer yt-dlp installed by the in-app updater must win over the bundled copy, so it
@@ -38,7 +41,8 @@ _SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
 _MAX_THUMB_BYTES = 8 * 1024 * 1024
 
 SUPPORTED_SITES: dict[str, str] = {"youtube": "YouTube", "reddit": "Reddit",
-                                   "tiktok": "TikTok", "instagram": "Instagram"}
+                                   "tiktok": "TikTok", "instagram": "Instagram",
+                                   "twitch": "Twitch", "kick": "Kick"}
 _SITE_HOSTS: dict[str, frozenset[str]] = {
     "youtube": frozenset(_YT_HOSTS | _SHORT_HOSTS),
     "reddit": frozenset({"reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com",
@@ -46,6 +50,8 @@ _SITE_HOSTS: dict[str, frozenset[str]] = {
     "tiktok": frozenset({"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com",
                          "vt.tiktok.com"}),
     "instagram": frozenset({"instagram.com", "www.instagram.com", "instagr.am"}),
+    "twitch": frozenset({"twitch.tv", "www.twitch.tv", "m.twitch.tv", "clips.twitch.tv"}),
+    "kick": frozenset({"kick.com", "www.kick.com"}),
 }
 _HOST_TO_SITE = {h: site for site, hosts in _SITE_HOSTS.items() for h in hosts}
 
@@ -82,7 +88,7 @@ class VideoInfo:
 
 
 # ---------------------------------------------------------------------- URLs
-_URL_HELP = "Paste a video link from YouTube, Reddit, TikTok or Instagram."
+_URL_HELP = "Paste a video link from YouTube, Reddit, TikTok, Instagram, Twitch or Kick."
 
 _REDDIT_SUB_RE = re.compile(r"^[A-Za-z0-9_-]{2,40}$")
 _REDDIT_ID_RE = re.compile(r"^[A-Za-z0-9]{4,12}$")
@@ -90,6 +96,19 @@ _TIKTOK_USER_RE = re.compile(r"^[\w.\-]{1,64}$")
 _TIKTOK_CODE_RE = re.compile(r"^[A-Za-z0-9_]{4,40}$")
 _IG_CODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,40}$")
 _IG_USER_RE = re.compile(r"^[A-Za-z0-9_.]{1,40}$")
+_TWITCH_CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{1,25}$")
+_TWITCH_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{3,120}$")
+_KICK_CHANNEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+_KICK_UUID_RE = re.compile(r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$")
+_KICK_CLIP_RE = re.compile(r"^clip_[A-Za-z0-9_-]{4,64}$")
+# first path segments on twitch.tv / kick.com that are site pages, not channels
+_TWITCH_RESERVED = frozenset({"directory", "videos", "search", "downloads", "settings", "p",
+                              "collections", "turbo", "jobs", "store", "login", "signup",
+                              "subscriptions", "inventory", "wallet", "drops", "friends",
+                              "messages", "moderator", "popout", "embed"})
+_KICK_RESERVED = frozenset({"video", "categories", "search", "auth", "browse", "dashboard",
+                            "following", "settings"})
+_CHANNEL_PAGE_MESSAGE = "This is a channel page; paste a video or clip link."
 
 
 def _watch_url(video_id: str) -> str:
@@ -119,7 +138,7 @@ def _split_url(url: str):
 
 def site_of(url: str) -> Optional[str]:
     """Key of ``SUPPORTED_SITES`` for a URL whose host is exactly on the allow-list
-    (``youtube``, ``reddit``, ``tiktok``, ``instagram``), else ``None``. Does not check
+    (``youtube``, ``reddit``, ``tiktok``, ``instagram``, ``twitch``, ``kick``), else ``None``. Does not check
     that the path points at a video - use :func:`validate_url` for that."""
     try:
         split = _split_url(url)
@@ -187,12 +206,52 @@ def _validate_instagram(host: str, segs: list[str]) -> str:
                      "Open the post and paste its link.")
 
 
+def _validate_twitch(host: str, segs: list[str]) -> str:
+    if host == "clips.twitch.tv":
+        if len(segs) == 1 and segs[0] != "embed" and _TWITCH_SLUG_RE.match(segs[0]):
+            return f"https://clips.twitch.tv/{segs[0]}"
+    elif len(segs) == 2 and segs[0] == "videos" and segs[1].isascii() and segs[1].isdigit() \
+            and len(segs[1]) <= 20:
+        return f"https://www.twitch.tv/videos/{segs[1]}"
+    elif len(segs) == 3 and segs[1] in ("v", "video") and _TWITCH_CHANNEL_RE.match(segs[0]) \
+            and segs[2].isascii() and segs[2].isdigit() and len(segs[2]) <= 20:
+        return f"https://www.twitch.tv/videos/{segs[2]}"        # /<channel>/v/<id>
+    elif len(segs) == 3 and segs[1] == "clip" and _TWITCH_CHANNEL_RE.match(segs[0]) \
+            and _TWITCH_SLUG_RE.match(segs[2]):
+        return f"https://www.twitch.tv/{segs[0]}/clip/{segs[2]}"
+    elif len(segs) == 2 and segs[0] == "clip" and _TWITCH_SLUG_RE.match(segs[1]):
+        return f"https://www.twitch.tv/clip/{segs[1]}"
+    elif segs and segs[0] not in _TWITCH_RESERVED and _TWITCH_CHANNEL_RE.match(segs[0]):
+        raise MediaError(_CHANNEL_PAGE_MESSAGE)
+    raise MediaError("That Twitch link does not point to a single video or clip. Open the "
+                     "VOD or clip and paste its link.")
+
+
+def _validate_kick(host: str, segs: list[str], query: dict) -> str:
+    if len(segs) == 3 and segs[1] == "videos" and _KICK_CHANNEL_RE.match(segs[0]) \
+            and _KICK_UUID_RE.match(segs[2].lower()):
+        return f"https://kick.com/{segs[0]}/videos/{segs[2].lower()}"
+    if len(segs) == 3 and segs[1] == "clips" and _KICK_CHANNEL_RE.match(segs[0]) \
+            and _KICK_CLIP_RE.match(segs[2]):
+        return f"https://kick.com/{segs[0]}/clips/{segs[2]}"
+    clip = (query.get("clip") or [""])[0]
+    if len(segs) == 1 and _KICK_CHANNEL_RE.match(segs[0]) and _KICK_CLIP_RE.match(clip):
+        return f"https://kick.com/{segs[0]}/clips/{clip}"       # /<channel>?clip=clip_...
+    if segs and segs[0] not in _KICK_RESERVED and _KICK_CHANNEL_RE.match(segs[0]) and (
+            len(segs) == 1 or (len(segs) == 2 and segs[1] in ("videos", "clips"))):
+        raise MediaError(_CHANNEL_PAGE_MESSAGE)
+    raise MediaError("That Kick link does not point to a single video or clip. Open the "
+                     "VOD or clip and paste its link.")
+
+
 def validate_url(url: str) -> str:
     """Return a normalised URL for a single video/post on a supported site.
 
     YouTube (standard, Shorts, youtu.be, embed, music, mobile) becomes
     ``https://www.youtube.com/watch?v=ID``. Reddit posts, TikTok videos and Instagram
-    posts/reels are reduced to their canonical form without tracking parameters. The
+    posts/reels, Twitch VODs/clips and Kick VODs/clips are reduced to their canonical
+    form without tracking parameters (a ``?t=`` start time is dropped: sections are
+    chosen explicitly). The
     host must match the allow-list exactly. Raises ``MediaError`` with a helpful message
     for anything else (empty, not a URL, other site, playlist/profile link, bad id)."""
     text = (url or "").strip()
@@ -214,6 +273,10 @@ def validate_url(url: str) -> str:
         return _validate_reddit(host, segs)
     if site == "tiktok":
         return _validate_tiktok(host, segs)
+    if site == "twitch":
+        return _validate_twitch(host, segs)
+    if site == "kick":
+        return _validate_kick(host, segs, parse_qs(parts.query))
     return _validate_instagram(host, segs)
 
 
@@ -253,6 +316,11 @@ LOGIN_MESSAGE = ("This post needs a login or isn't public. ClipForge doesn't sto
 UPDATE_HINT = ("The site may have changed. Update the downloader in Settings "
                "(Downloader > Update) and try again.")
 NO_VIDEO_MESSAGE = "This post has no video."
+LIVE_MESSAGE = "Live streams can't be downloaded; wait until the VOD is available."
+SUBONLY_MESSAGE = ("This VOD is for subscribers only. ClipForge doesn't sign in to "
+                   "accounts, so it can only download public videos.")
+EXPIRED_MESSAGE = ("This VOD is no longer available; it has expired or been deleted by "
+                   "the streamer.")
 
 # {site} = display name of the site, {noun} = "video" (YouTube) or "post" (others)
 _ERROR_RULES: list[tuple[tuple[str, ...], str]] = [
@@ -302,7 +370,19 @@ _LOGIN_NEEDLES = ("login", "log in", "logged in", "logged-in", "sign in",
                   "rate-limit", "rate limit", "empty media response", "registered users",
                   "not granting access", "must be 18", "restricted video", "members only",
                   "members-only", "http error 401", "http error 403",
-                  "only available for")
+                  "only available for", "mature content", "mature audience", "for mature")
+_SUBONLY_NEEDLES = ("subscriber-only", "subscriber only", "subscribers only",
+                    "subscribers-only", "sub-only", "sub only", "channel subscription",
+                    "requires a subscription", "subscriber")
+_SUBONLY_ANY_SITE = ("subscriber-only", "subscribers-only", "subscribers only",
+                     "sub-only", "channel subscription")
+_EXPIRED_NEEDLES = ("expired", "vod is no longer", "vod was deleted", "vod has been deleted",
+                    "vod no longer", "does not exist")
+# Twitch / Kick extractor or API breakage (as opposed to a network problem)
+_TK_BREAKAGE = ("gql", "unable to download json", "unable to download m3u8", "invalid json",
+                "http error 5", "unexpected", "api error", "kick api")
+_NETWORK_HINTS = ("urlopen", "getaddrinfo", "timed out", "timeout", "connection",
+                  "name or service", "temporary failure", "remote end closed", "ssl")
 _NO_VIDEO_NEEDLES = ("there is no video", "no video in this post", "has no video",
                      "no video formats", "no video found", "no media found")
 # Phrases that are unambiguous even when the site is not known.
@@ -317,6 +397,16 @@ def translate_error(exc: BaseException | str, site: Optional[str] = None) -> str
     raw = str(exc) if not isinstance(exc, str) else exc
     low = raw.lower()
     other_site = site in SUPPORTED_SITES and site != "youtube"
+    tk_site = site in ("twitch", "kick")
+    if any(n in low for n in _SUBONLY_ANY_SITE) or (
+            tk_site and any(n in low for n in _SUBONLY_NEEDLES)):
+        return SUBONLY_MESSAGE
+    if tk_site and any(n in low for n in _EXPIRED_NEEDLES):
+        return EXPIRED_MESSAGE
+    if tk_site and any(n in low for n in _TK_BREAKAGE) and not any(
+            n in low for n in _NETWORK_HINTS) and not any(
+            n in low for n in ("http error 404", "http error 401", "http error 403")):
+        return UPDATE_HINT
     if other_site:
         if any(n in low for n in _NO_VIDEO_NEEDLES):
             return NO_VIDEO_MESSAGE
@@ -325,7 +415,7 @@ def translate_error(exc: BaseException | str, site: Optional[str] = None) -> str
     elif any(n in low for n in _ANY_SITE_LOGIN_NEEDLES):
         return LOGIN_MESSAGE
     name = SUPPORTED_SITES.get(site or "", "the site")
-    noun = "post" if other_site else "video"
+    noun = "post" if other_site and not tk_site else "video"
     for needles, message in _ERROR_RULES:
         if any(n in low for n in needles):
             text = message.replace("{site}", name).replace("{noun}", noun)
@@ -372,6 +462,130 @@ class _YtdlpLogger:
 
 class _DownloadCancelled(Exception):
     pass
+
+
+# ---------------------------------------------------- stopping yt-dlp's FFmpeg child
+# A section download is done by yt-dlp's FFmpeg downloader, which blocks in
+# ``Popen.wait()`` without calling any progress hook, so a hook can't interrupt it.
+# yt-dlp's FFmpeg downloader creates its process through the module-level ``Popen`` name;
+# a transparent subclass records the processes started by watched worker threads so a
+# cancel can kill them promptly. Behaviour for every other caller is unchanged.
+_proc_lock = threading.Lock()
+_watched_threads: set[int] = set()
+_thread_procs: dict[int, list] = {}
+
+
+class _TrackedPopen(yt_dlp.utils.Popen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ident = threading.get_ident()
+        with _proc_lock:
+            if ident in _watched_threads:
+                _thread_procs.setdefault(ident, []).append(self)
+
+
+def _install_tracking() -> bool:
+    try:
+        import yt_dlp.downloader.external as ext  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    if not hasattr(ext, "Popen"):
+        return False
+    if not issubclass(ext.Popen, _TrackedPopen):
+        ext.Popen = _TrackedPopen
+    return True
+
+
+_TRACKING = _install_tracking()
+
+
+def _watch_thread(ident: int) -> None:
+    with _proc_lock:
+        _watched_threads.add(ident)
+        _thread_procs.pop(ident, None)
+
+
+def _unwatch_thread(ident: int) -> None:
+    with _proc_lock:
+        _watched_threads.discard(ident)
+        _thread_procs.pop(ident, None)
+
+
+def _kill_thread_procs(ident: Optional[int]) -> int:
+    """Kill the FFmpeg processes started by the watched thread ``ident``."""
+    if ident is None:
+        return 0
+    with _proc_lock:
+        procs = list(_thread_procs.get(ident, []))
+    killed = 0
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                killed += 1
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Could not stop ffmpeg: %s", exc)
+    return killed
+
+
+def _bind_ffmpeg_location(ffmpeg_dir: str) -> None:
+    """yt-dlp decides whether its FFmpeg downloader (needed for sections) is usable with
+    ``FFmpegFD.available()``, which only knows ``ffmpeg_location`` through a context
+    variable the yt-dlp CLI sets; API users must set it themselves, per thread, or the
+    bundled FFmpeg is not found when it is not on PATH."""
+    try:
+        from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor  # noqa: PLC0415
+        FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_dir)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Could not bind ffmpeg location for yt-dlp: %s", exc)
+
+
+# ------------------------------------------------------------------ sections
+_MIN_SECTION = 0.5
+_DURATION_SLACK = 1.0       # an end up to this far past the reported duration is clamped
+
+
+def _clamp_section(section: Sequence[float], duration: float) -> tuple[float, float]:
+    """Validated ``(start, end)``; ``end`` slightly past ``duration`` is clamped to it.
+    Raises ``ValueError`` (short, user-facing) when the range makes no sense."""
+    try:
+        start, end = float(section[0]), float(section[1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError("The section needs a start and an end time.") from exc
+    if start != start or end != end or start == float("inf") or end == float("inf"):
+        raise ValueError("The section times are not valid.")
+    if start < 0:
+        raise ValueError("The section start can't be negative.")
+    if end <= start:
+        raise ValueError("The section end must be after its start.")
+    if duration and duration > 0:
+        if start >= duration:
+            raise ValueError("The section starts after the end of the video.")
+        if end > duration + _DURATION_SLACK:
+            raise ValueError("The section ends after the end of the video.")
+        end = min(end, duration)
+    if end - start < _MIN_SECTION:
+        raise ValueError("The section must be at least half a second long.")
+    return start, end
+
+
+def _tag_time(seconds: float) -> str:
+    """``1m30s`` / ``1h02m03s`` / ``45s`` / ``1m30.5s`` - safe in Windows file names."""
+    tenths = int(round(max(0.0, seconds) * 10))
+    whole, frac = divmod(tenths, 10)
+    h, rem = divmod(whole, 3600)
+    m, sec = divmod(rem, 60)
+    tail = f".{frac}" if frac else ""
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}{tail}s"
+    if m:
+        return f"{m}m{sec:02d}{tail}s"
+    return f"{sec}{tail}s"
+
+
+def section_tag(start: float, end: float) -> str:
+    """File-name suffix for a section, e.g. ``"1m30s-2m15s"``."""
+    return f"{_tag_time(start)}-{_tag_time(end)}"
 
 
 def _base_opts() -> dict[str, Any]:
@@ -575,16 +789,27 @@ class DownloadJob(QObject):
     ``Retry`` resumes an interrupted download. Cancelling keeps yt-dlp's ``.part``
     fragments too (so a retry resumes) and removes nothing else."""
 
-    progress = Signal(float, str, str)   # fraction 0..1 (-1 unknown), speed text, ETA text
+    # fraction 0..1, speed text, ETA text. A fraction < 0 (-1.0) means "indeterminate":
+    # no real total is known (a section download before FFmpeg reports its first time=,
+    # merging, preparing) and the UI should show a busy bar, not a percentage.
+    progress = Signal(float, str, str)
     stage = Signal(str)                  # "Downloading video…", "Merging…", …
     finished = Signal(str, object)       # output file path, VideoInfo
     failed = Signal(str)
     cancelled = Signal()
 
     def __init__(self, info: VideoInfo, quality: str, dest_dir: str,
-                 parent: Optional[QObject] = None) -> None:
+                 parent: Optional[QObject] = None, *,
+                 section: Optional[tuple[float, float]] = None) -> None:
         super().__init__(parent)
         self._info = info
+        # ``section=(start_s, end_s)``: download only that range (frame-accurate cuts
+        # through the bundled FFmpeg). ValueError when it is not a valid range.
+        self._section: Optional[tuple[float, float]] = (
+            _clamp_section(section, float(info.duration or 0)) if section is not None
+            else None)
+        self._worker_ident: Optional[int] = None
+        self._progress_file = ""
         q = str(quality).strip()
         # QUALITY_CHOICES, or a real height reported by another site (e.g. "540")
         self._quality = q if q in QUALITY_CHOICES or (q.isascii() and q.isdigit()
@@ -612,6 +837,8 @@ class DownloadJob(QObject):
 
     def cancel(self) -> None:
         self._cancel.set()
+        if self._section is not None:
+            _kill_thread_procs(self._worker_ident)
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -633,6 +860,15 @@ class DownloadJob(QObject):
             "postprocessor_hooks": [self._on_postprocess],
             "fragment_retries": 5,
         })
+        if self._section is not None:
+            start, end = self._section
+            opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(start, end)])
+            opts["force_keyframes_at_cuts"] = True     # frame-accurate cut points
+            if self._progress_file:
+                # FFmpeg writes "out_time_us=..." lines here; read by _SectionMonitor
+                opts["external_downloader_args"] = {
+                    "ffmpeg_o": ["-progress", self._progress_file.replace("\\", "/"),
+                                 "-nostats"]}
         return opts
 
     def _on_postprocess(self, d: dict) -> None:
@@ -647,6 +883,8 @@ class DownloadJob(QObject):
     def _on_progress(self, d: dict) -> None:
         if self._cancel.is_set():
             raise _DownloadCancelled()
+        if self._section is not None:
+            return          # progress comes from FFmpeg's own time= via _SectionMonitor
         status = d.get("status")
         fname = str(d.get("filename") or d.get("tmpfilename") or "")
         if fname and fname != self._current_file:
@@ -681,12 +919,31 @@ class DownloadJob(QObject):
         probe = dict(data)
         probe["ext"] = "mp4"
         expected = ydl.prepare_filename(probe)
-        final = unique_path(os.path.splitext(expected)[0] + ".mp4")
+        suffix = f" {section_tag(*self._section)}" if self._section is not None else ""
+        final = unique_path(os.path.splitext(expected)[0] + suffix + ".mp4")
         stem = os.path.splitext(final)[0]
         ydl.params["outtmpl"] = {"default": stem.replace("%", "%%") + ".%(ext)s"}
         return final
 
     def _run(self) -> None:
+        self._worker_ident = threading.get_ident()
+        if self._section is not None:
+            _watch_thread(self._worker_ident)
+        try:
+            self._run_guarded()
+        finally:
+            _unwatch_thread(self._worker_ident)
+            self._drop_progress_file()
+
+    def _drop_progress_file(self) -> None:
+        path, self._progress_file = self._progress_file, ""
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _run_guarded(self) -> None:
         self._expected_total = None
         self._completed_bytes = 0.0
         self._current_file = ""
@@ -714,8 +971,9 @@ class DownloadJob(QObject):
         self.cancelled.emit()
 
     def _run_inner(self) -> None:
-        if self._info.is_live:
-            raise MediaError("This is a live stream. Try again once it has ended.")
+        if self._info.is_live or (self._section is not None
+                                  and float(self._info.duration or 0) <= 0):
+            raise MediaError(LIVE_MESSAGE)
         try:
             ffmpeg_dir = os.path.dirname(ffmpeg.ffmpeg_path())
         except MediaError:
@@ -729,6 +987,11 @@ class DownloadJob(QObject):
 
         self.stage.emit("Preparing…")
         self.progress.emit(-1.0, "", "")
+        if self._section is not None:
+            _bind_ffmpeg_location(ffmpeg_dir)
+            fd, self._progress_file = tempfile.mkstemp(prefix="clipforge-dl-",
+                                                       suffix=".progress")
+            os.close(fd)
         opts = _checked(self._options(ffmpeg_dir))
         site = site_of(url) or self._info.site
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -743,22 +1006,48 @@ class DownloadJob(QObject):
                 raise MediaError(NO_VIDEO_MESSAGE)
             data["title"] = _clean_title(data.get("title"), site, str(data.get("id") or ""))
             if data.get("is_live") or data.get("live_status") in ("is_live", "is_upcoming"):
-                raise MediaError("This is a live stream. Try again once it has ended.")
+                raise MediaError(LIVE_MESSAGE)
+            if self._section is not None:
+                self._check_section_against(data)
+                ydl.params["download_ranges"] = yt_dlp.utils.download_range_func(
+                    None, [self._section])
             final = self._plan(ydl, data)
             self._prepare_progress_model(ydl, data)
-            self.stage.emit("Downloading video…")
-            result = ydl.process_ie_result(data, download=True)
+            self.stage.emit("Downloading section…" if self._section is not None
+                            else "Downloading video…")
+            monitor = _SectionMonitor(self) if self._section is not None else None
+            try:
+                if monitor:
+                    monitor.start()
+                result = ydl.process_ie_result(data, download=True)
+            finally:
+                if monitor:
+                    monitor.stop()
             if self._cancel.is_set():
                 raise _DownloadCancelled()
             path = self._result_path(result, final)
         if not path or not os.path.isfile(path):
             raise MediaError("The download finished but the file could not be found. "
                              "Please try again.", f"expected {final}")
+        self._drop_progress_file()
         self.progress.emit(1.0, "", "")
         self.stage.emit("Done")
         self.finished.emit(path, self._info)
 
+    def _check_section_against(self, data: dict) -> None:
+        """Re-validate the range against the duration yt-dlp reports (may differ)."""
+        real = float(data.get("duration") or self._info.duration or 0)
+        if real <= 0:
+            raise MediaError(LIVE_MESSAGE)
+        try:
+            self._section = _clamp_section(self._section, real)
+        except ValueError as exc:
+            raise MediaError(f"{exc} The video is {format_clock(real)} long.") from exc
+
     def _prepare_progress_model(self, ydl: Any, data: dict) -> None:
+        if self._section is not None:
+            self._streams_total = 1
+            return          # byte totals are meaningless for an FFmpeg section download
         try:
             selector = ydl.build_format_selector(build_format_selector(self._quality))
             ctx = {"formats": data.get("formats") or [], "incomplete_formats": False}
@@ -785,6 +1074,69 @@ class DownloadJob(QObject):
             if p and os.path.isfile(p):
                 return p
         return fallback
+
+
+class _SectionMonitor:
+    """Turns FFmpeg's ``-progress`` file (``out_time_us=`` lines) into real progress for a
+    section download, and enforces cancel by killing the FFmpeg child when the job's
+    cancel flag is set. Until FFmpeg reports its first time the bar stays indeterminate."""
+
+    def __init__(self, job: "DownloadJob") -> None:
+        self._job = job
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ident = threading.get_ident()      # the worker thread that owns the child
+        self._path = job._progress_file
+        self._speed = ""
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._loop, name="yt-section-progress",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(2)
+
+    def _read_seconds(self) -> Optional[float]:
+        if not self._path:
+            return None
+        try:
+            with open(self._path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            return None
+        value = None
+        for line in text.splitlines():
+            if line.startswith(("out_time_us=", "out_time_ms=")):
+                try:
+                    value = int(line.split("=", 1)[1]) / 1_000_000.0
+                except ValueError:
+                    pass
+            elif line.startswith("speed="):
+                self._speed = line.split("=", 1)[1].strip()
+        return value
+
+    def _loop(self) -> None:
+        job = self._job
+        start, end = job._section
+        total = max(end - start, 0.001)
+        t0 = time.monotonic()
+        while not self._stop.wait(0.3):
+            if job._cancel.is_set():
+                _kill_thread_procs(self._ident)
+                return
+            seconds = self._read_seconds()
+            if seconds is None or seconds < 0:
+                continue
+            fraction = max(0.0, min(0.99, seconds / total))
+            elapsed = time.monotonic() - t0
+            eta = ""
+            if 0.02 < fraction < 0.99 and elapsed > 1:
+                eta = _fmt_eta(elapsed * (1 - fraction) / fraction)
+            speed = self._speed if self._speed not in ("", "N/A") else ""
+            job.progress.emit(fraction, speed, eta)
 
 
 def _is_cancel(exc: BaseException) -> bool:

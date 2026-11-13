@@ -32,9 +32,10 @@ from typing import Optional, Sequence
 from PySide6.QtCore import QObject, Signal
 
 from .. import paths
+from ..core.captions import CaptionLine, CaptionStyle, Word, style_for_preset
 from ..core.model import ExportSettings, MediaSource, Segment
 from ..workers import Cancelled, CancelToken
-from . import MediaError, ffmpeg, probe
+from . import MediaError, ass, ffmpeg, probe
 
 log = logging.getLogger(__name__)
 
@@ -135,12 +136,50 @@ def _output_fps(sources: Sequence[MediaSource], settings: ExportSettings) -> flo
     return fps if 1 <= fps <= 240 else 30.0
 
 
+_ASPECTS = {"9:16": (9, 16), "4:5": (4, 5), "1:1": (1, 1), "16:9": (16, 9)}
+_MAX_SHORT_SIDE = 2160
+_SOCIAL_SHORT_SIDE = 1080
+
+
+def _aspect_ratio(settings: ExportSettings) -> Optional[tuple[int, int]]:
+    """``(w, h)`` ratio of a chosen canvas aspect, None for "source" (or unknown)."""
+    return _ASPECTS.get((settings.aspect or "source").strip().lower())
+
+
+def _canvas_size(sources: Sequence[MediaSource], settings: ExportSettings,
+                 ratio: tuple[int, int]) -> tuple[int, int]:
+    """Canvas for a fixed aspect. Short side = the chosen resolution when it is a number
+    (up to 2160, user's choice even if it upscales); with "source" it is the largest short
+    side among ``sources``, capped at 1080 for the portrait/square social aspects (a 4K
+    clip still gives a 1080x1920 file) and at 2160 for 16:9. Dimensions are even."""
+    res = (settings.resolution or "source").strip().lower()
+    short = 0
+    try:
+        short = int(float(res))
+    except ValueError:
+        pass
+    if short <= 0:
+        shorts = [min(s.width, s.height) for s in sources if s.width > 0 and s.height > 0]
+        cap = _MAX_SHORT_SIDE if ratio[0] > ratio[1] else _SOCIAL_SHORT_SIDE
+        short = min(max(shorts) if shorts else 1080, cap)
+    short = max(2, min(short, _MAX_SHORT_SIDE))
+    rw, rh = ratio
+    if rw > rh:                                            # landscape: height is the short side
+        return _even_near(short * rw / rh), _even_near(short)
+    return _even_near(short), _even_near(short * rh / rw)
+
+
 def resolve_output_size(sources: Sequence[MediaSource], settings: ExportSettings) -> tuple[int, int]:
     """Even ``(width, height)`` for the export. "source" keeps the first segment's
     source size; a number is the *short side* (so "1080" → 1920x1080 for 16:9 and
-    1080x1920 for 9:16), aspect ratio preserved, never upscaling past the source."""
+    1080x1920 for 9:16), aspect ratio preserved, never upscaling past the source.
+    With ``settings.aspect`` other than "source" the canvas has that aspect ratio instead
+    (see :func:`_canvas_size` for how its size is chosen)."""
     if not sources:
         raise MediaError("There is nothing to export.")
+    ratio = _aspect_ratio(settings)
+    if ratio is not None:
+        return _canvas_size(sources, settings, ratio)
     w, h = sources[0].width, sources[0].height
     if w <= 0 or h <= 0:
         w, h = 1920, 1080
@@ -233,7 +272,8 @@ def _cut_is_clean(src: MediaSource, seg: Segment) -> Optional[str]:
 
 
 def can_fast_export(sources: dict[str, MediaSource], segments: Sequence[Segment],
-                    settings: ExportSettings) -> tuple[bool, str]:
+                    settings: ExportSettings,
+                    captions: Sequence[CaptionLine] = ()) -> tuple[bool, str]:
     """Whether stream copy gives *accurate* results; second item says why not.
 
     Requires: no gaps, no muted segments (unless audio is off for all), all segments
@@ -242,6 +282,11 @@ def can_fast_export(sources: dict[str, MediaSource], segments: Sequence[Segment]
     ``source_out`` unless it is the end of the file - within half a frame of a keyframe
     from ``probe.load_keyframes``). The end matters too: stream copy cuts by decode
     time, so a mid-GOP end would leave a few frames of the following material."""
+    if _aspect_ratio(settings) is not None:
+        return False, ("A different picture shape (aspect ratio) was chosen, which needs the "
+                       "video to be re-framed and re-encoded.")
+    if settings.captions and captions:
+        return False, "Captions are burned into the picture, which needs the video to be re-encoded."
     if any(s.is_audio for s in segments):
         return False, ("The timeline has detached audio clips, which have to be mixed into "
                        "the sound, so the export is re-encoded.")
@@ -324,7 +369,9 @@ def _norm_codec(settings: ExportSettings) -> str:
 
 def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
                settings: ExportSettings, *, temp_dir: str,
-               video_encoder: Optional[str] = None) -> ExportPlan:
+               video_encoder: Optional[str] = None,
+               captions: Sequence[CaptionLine] = (),
+               caption_style: Optional[CaptionStyle] = None) -> ExportPlan:
     """Turn timeline segments into FFmpeg commands.
 
     ``segments`` are in timeline order with their real ``timeline_start`` values
@@ -337,6 +384,8 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
     missing/muted audio with black/silence, concatenates with the concat filter and
     encodes once (``-movflags +faststart``, yuv420p, AAC 48 kHz stereo).
     ``video_encoder`` overrides ``ffmpeg.pick_video_encoder`` (used by tests).
+    ``captions`` (timeline-time lines) are burned in with ``caption_style`` (default: the
+    "pop" preset) when ``settings.captions`` is on; this forces accurate mode.
     Raises ``MediaError`` for an empty timeline or missing source files."""
     everything = _ordered(segments)
     segs = [s for s in everything if not s.is_audio]
@@ -360,11 +409,13 @@ def build_plan(sources: dict[str, MediaSource], segments: Sequence[Segment],
     out_path = output_path_for(settings)
     ctx = dict(sources=sources, segs=segs, used=used, settings=settings, temp_dir=temp_dir,
                uid=uid, out_path=out_path)
-    acc = dict(asegs=asegs, aused=aused, video_encoder=video_encoder)
+    acc = dict(asegs=asegs, aused=aused, video_encoder=video_encoder,
+               captions=list(captions) if settings.captions else [],
+               caption_style=caption_style)
 
     if mode == "accurate":
         return _plan_accurate(**ctx, reason="Frame-accurate export (re-encoded) was selected.", **acc)
-    ok, why = can_fast_export(sources, everything, settings)
+    ok, why = can_fast_export(sources, everything, settings, captions)
     if mode == "fast":
         if not ok:
             raise MediaError(f"Fast export is not possible: {why}", detail=why)
@@ -484,8 +535,123 @@ def _write_text(path: str, text: str) -> None:
         fh.write(text)
 
 
+def _escape_level(text: str, specials: str) -> str:
+    text = text.replace("\\", "\\\\")
+    for ch in specials:
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _filter_path(path: str) -> str:
+    """``path`` as the value of a filter option inside a filter graph given on the command
+    line (no shell): forward slashes, then escaped for the option parser (``\\ ' :``) and
+    again for the graph parser (``\\ ' [ ] , ;``) - the classic ``C\\\\:/dir/file`` form."""
+    p = path.replace("\\", "/")
+    return _escape_level(_escape_level(p, "':"), "'[],;")
+
+
+def _shift_captions(lines: Sequence[CaptionLine], origin: float, total: float) -> list[CaptionLine]:
+    """Captions moved from timeline time to output time (``-origin``) and clipped to
+    ``[0, total]``; lines (and words) wholly outside are dropped."""
+    out: list[CaptionLine] = []
+    for ln in sorted(lines, key=lambda x: x.start):
+        s, e = max(0.0, ln.start - origin), min(total, ln.end - origin)
+        if e - s < 0.02:
+            continue
+        words: list[Word] = []
+        for w in ln.words:
+            ws, we = max(s, w.start - origin), min(e, w.end - origin)
+            if we > ws or (ws < e and w.end - w.start <= 0):
+                words.append(Word(ws, max(we, ws), w.text))
+        out.append(CaptionLine(s, e, ln.text, words))
+    return out
+
+
+_filters_cache: Optional[str] = None
+
+
+def _ffmpeg_has_filter(name: str) -> bool:
+    global _filters_cache
+    if _filters_cache is None:
+        _filters_cache = ffmpeg.run_capture(["-hide_banner", "-filters"], tool="ffmpeg", timeout=30)
+    return re.search(rf"^\s*\S+\s+{re.escape(name)}\s", _filters_cache, re.M) is not None
+
+
+def _fonts_dir() -> str:
+    d = os.path.join(os.environ.get("WINDIR") or r"C:\Windows", "Fonts")
+    return d if os.path.isdir(d) else ""
+
+
+def _font_installed(family: str) -> bool:
+    """Best-effort check that ``family`` is an installed Windows font (registry list);
+    True when it cannot be told."""
+    try:
+        import winreg
+    except ImportError:
+        return True
+    want = family.strip().lower()
+    for hive, sub in ((winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"),
+                      (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")):
+        try:
+            with winreg.OpenKey(hive, sub) as key:
+                i = 0
+                while True:
+                    try:
+                        name, _v, _t = winreg.EnumValue(key, i)
+                    except OSError:
+                        break
+                    i += 1
+                    base = re.sub(r"\s*\((TrueType|OpenType)\)\s*$", "", name, flags=re.I).lower()
+                    if base == want or any(part.strip() == want for part in base.split(" & ")):
+                        return True
+        except OSError:
+            continue
+    return False
+
+
+def _reframe_chain(idx: int, label: str, d: str, seg: Segment, src: MediaSource,
+                   width: int, height: int, mode: str, fps_e: str) -> str:
+    """Filter chain(s) turning input ``idx`` into a ``width`` x ``height`` canvas picture
+    (modes "fill", "blur", "fit"), ending in ``[label]``."""
+    head = f"trim=duration={d},setpts=PTS-STARTPTS"
+    tail = f"setsar=1,fps={fps_e},format=yuv420p"
+    sw, sh = _even_down(src.width), _even_down(src.height)
+    src_in = f"[{idx}:v:0]"
+    if src.width <= 0 or src.height <= 0 or mode == "fit":
+        return (f"{src_in}{head},scale={width}:{height}:force_original_aspect_ratio=decrease:"
+                f"force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"{tail}[{label}]")
+    canvas = width / height
+    if abs(sw / sh - canvas) < 0.01:                       # already the canvas shape
+        return f"{src_in}{head},scale={width}:{height},{tail}[{label}]"
+    if mode == "blur":
+        bw, bh = _even_near(width / 6), _even_near(height / 6)
+        return (
+            f"{src_in}{head},fps={fps_e},split=2[bs{label}][fs{label}];"
+            f"[bs{label}]scale={bw}:{bh}:force_original_aspect_ratio=increase,"
+            f"crop={bw}:{bh},gblur=sigma=5:steps=2,eq=brightness=-0.12:saturation=0.9,"
+            f"scale={width}:{height}:flags=bilinear[bb{label}];"
+            f"[fs{label}]scale={width}:{height}:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2[ff{label}];"
+            f"[bb{label}][ff{label}]overlay=(W-w)/2:(H-h)/2:shortest=1,setsar=1,"
+            f"format=yuv420p[{label}]")
+    # fill: crop to the canvas shape, then scale
+    if sw / sh > canvas:                                   # wider: crop sideways (pan-able)
+        cw, ch = min(sw, _even_down(sh * canvas)), sh
+        a, b = seg.crop_x_at(seg.source_in), seg.crop_x_at(seg.source_out)
+        if abs(a - b) < 1e-4 or seg.duration <= 0:
+            crop = f"crop={cw}:{ch}:{int(round((sw - cw) * a))}:0"
+        else:
+            crop = (f"crop={cw}:{ch}:x='(iw-ow)*clip({_fmt(a)}+({_fmt(b - a)})*t/"
+                    f"{_fmt(seg.duration)},0,1)':y=0")
+    else:                                                  # taller: crop vertically, centred
+        cw, ch = sw, min(sh, _even_down(sw / canvas))
+        crop = f"crop={cw}:{ch}:0:{int(round((sh - ch) / 2))}"
+    return f"{src_in}{head},{crop},scale={width}:{height},{tail}[{label}]"
+
+
 def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, reason,
-                   video_encoder, asegs=(), aused=()) -> ExportPlan:
+                   video_encoder, asegs=(), aused=(), captions=(), caption_style=None) -> ExportPlan:
     ref = used or list(aused)                # picture format comes from the video lane
     width, height = resolve_output_size(ref, settings)
     fps = _output_fps(ref, settings)
@@ -496,9 +662,13 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
     plan = ExportPlan(mode="accurate", reason=reason, output_path=out_path, width=width,
                       height=height, fps=fps, video_encoder=encoder)
 
+    reframing = _aspect_ratio(settings) is not None
+    reframe = (settings.reframe or "fill").lower()
+    if reframe not in ("fill", "blur", "fit"):
+        reframe = "fill"
     out_ar = width / height
     mixed = {round(s.width / max(1, s.height), 2) for s in used}
-    if any(abs(a - round(out_ar, 2)) > 0.02 for a in mixed):
+    if (not reframing or reframe == "fit") and any(abs(a - round(out_ar, 2)) > 0.02 for a in mixed):
         plan.warnings.append("Clips with a different aspect ratio are letterboxed to fit the "
                              "output size.")
     if len({round(s.fps, 2) for s in used}) > 1 and (settings.fps or "source") == "source":
@@ -547,14 +717,17 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
             inputs += ["-ss", _fmt(seg.source_in)]
         inputs += ["-t", d, "-i", src.path]
 
-        vf = [f"trim=duration={d}", "setpts=PTS-STARTPTS"]
-        sw, sh = _even_down(src.width) if src.width else width, _even_down(src.height) if src.height else height
-        if (sw, sh) != (width, height):
-            vf.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-                      f"force_divisible_by=2")
-            vf.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
-        vf += ["setsar=1", f"fps={fps_e}", "format=yuv420p"]
-        chains.append(f"[{idx}:v:0]{','.join(vf)}[v{i}]")
+        if reframing:
+            chains.append(_reframe_chain(idx, f"v{i}", d, seg, src, width, height, reframe, fps_e))
+        else:
+            vf = [f"trim=duration={d}", "setpts=PTS-STARTPTS"]
+            sw, sh = _even_down(src.width) if src.width else width, _even_down(src.height) if src.height else height
+            if (sw, sh) != (width, height):
+                vf.append(f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+                          f"force_divisible_by=2")
+                vf.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
+            vf += ["setsar=1", f"fps={fps_e}", "format=yuv420p"]
+            chains.append(f"[{idx}:v:0]{','.join(vf)}[v{i}]")
         labels.append(f"[v{i}]")
 
         if with_audio:
@@ -592,9 +765,30 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
             f"{''.join(mix_in)}amix=inputs={len(mix_in)}:duration=longest:normalize=0,"
             f"alimiter=limit=0.97,apad=whole_dur={td},atrim=duration={td},"
             f"aformat=sample_fmts=fltp:sample_rates={AUDIO_RATE}:channel_layouts=stereo[outa]")
-    graph = ";".join(chains + [concat] + tail_chains)
+    temps: list[str] = []
+    video_label = "[outv]"
+    caption_chain: list[str] = []
+    shifted = _shift_captions(captions, origin, total) if (settings.captions and captions) else []
+    if shifted:
+        style = caption_style or style_for_preset("pop")
+        if not _ffmpeg_has_filter("ass"):
+            raise MediaError("Captions cannot be burned in: this FFmpeg build has no subtitle "
+                             "renderer (the \"ass\" filter).")
+        if not _font_installed(style.font):
+            plan.warnings.append(f"The caption font \"{style.font}\" is not installed, so a "
+                                 "substitute font is used.")
+        ass_path = os.path.join(temp_dir, f"cf_{uid}_captions.ass")
+        temps.append(ass_path)
+        _write_text(ass_path, ass.build_ass(shifted, style, width, height))
+        opts = f"filename={_filter_path(ass_path)}"
+        fonts = _fonts_dir()
+        if fonts:
+            opts += f":fontsdir={_filter_path(fonts)}"
+        caption_chain = [f"[outv]ass={opts}[outvc]"]
+        video_label = "[outvc]"
+    graph = ";".join(chains + [concat] + caption_chain + tail_chains)
 
-    out_args = ["-map", "[outv]"]
+    out_args = ["-map", video_label]
     if with_audio:
         out_args += ["-map", "[outa]"]
     out_args += _video_encoder_args(encoder, codec, settings.quality)
@@ -607,7 +801,6 @@ def _plan_accurate(*, sources, segs, used, settings, temp_dir, uid, out_path, re
         out_args += ["-movflags", "+faststart"]
     out_args += ["-max_muxing_queue_size", "4096", partial_path(out_path)]
 
-    temps: list[str] = []
     if len(graph) + sum(len(a) + 1 for a in inputs + out_args) > _MAX_INLINE_ARGS:
         gpath = os.path.join(temp_dir, f"cf_{uid}_filter.txt")
         _write_text(gpath, graph)
@@ -653,8 +846,13 @@ class ExportJob(QObject):
 
     def __init__(self, sources: dict[str, MediaSource], segments: Sequence[Segment],
                  settings: ExportSettings, *, temp_dir: str,
+                 captions: Sequence[CaptionLine] = (),
+                 caption_style: Optional[CaptionStyle] = None,
                  parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
+        self._captions = [c.copy() for c in captions]
+        self._caption_style = (CaptionStyle.from_dict(caption_style.to_dict())
+                               if caption_style is not None else None)
         self._sources = dict(sources)
         self._segments = [s.copy() for s in segments]
         self._settings = ExportSettings.from_dict(settings.to_dict())
@@ -696,7 +894,8 @@ class ExportJob(QObject):
             os.makedirs(self._temp_dir, exist_ok=True)
             self._t0 = time.monotonic()
             plan = build_plan(self._sources, self._segments, self._settings,
-                              temp_dir=self._temp_dir)
+                              temp_dir=self._temp_dir, captions=self._captions,
+                              caption_style=self._caption_style)
             self._track(plan)
             os.makedirs(os.path.dirname(plan.output_path) or ".", exist_ok=True)
             try:
@@ -712,7 +911,8 @@ class ExportJob(QObject):
                 self._t0 = time.monotonic()
                 plan = build_plan(self._sources, self._segments, self._settings,
                                   temp_dir=self._temp_dir,
-                                  video_encoder=ffmpeg.cpu_encoder(self._settings.codec))
+                                  video_encoder=ffmpeg.cpu_encoder(self._settings.codec),
+                                  captions=self._captions, caption_style=self._caption_style)
                 self._track(plan)
                 self._execute(plan)
             self._cancel.raise_if_cancelled()

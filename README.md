@@ -6,7 +6,11 @@ Built with Python 3.12, PySide6, yt-dlp, FFmpeg and PyInstaller.
 
 ## Features
 
-- Download a video by pasting its link (`Ctrl+L`) from YouTube (videos and Shorts), Reddit, TikTok or Instagram (public posts only), choosing a quality.
+- Download a video by pasting its link (`Ctrl+L`) from YouTube (videos and Shorts), Reddit, TikTok, Instagram (public posts only), Twitch or Kick, choosing a quality.
+- **Download only a section** of a long video or VOD: tick "Download only a section" and enter start and end times, so you never fetch the whole stream.
+- **Make vertical clips:** choose a canvas (9:16, 4:5, 1:1, 16:9) and how clips fill it (crop, blurred background or bars). Drag the crop in the preview, or set a Start and End position for a slow pan.
+- **Auto-captions:** generate word-by-word captions locally with Whisper (free, private, your computer only), edit them, pick a style (Pop, Classic, Boxed, Minimal) and burn them into the export. The speech model downloads once, after asking you.
+- **Export presets** for TikTok / Reels / Shorts, Instagram feed, square and YouTube.
 - Import local video files (`.mp4`, `.mov`, `.mkv`, `.webm`, `.m4v`) with `Ctrl+I` or drag and drop.
 - Single-track timeline: split, delete, ripple delete, trim, reorder, mute, close gaps.
 - Undo and redo for every edit.

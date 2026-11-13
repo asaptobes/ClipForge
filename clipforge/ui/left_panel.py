@@ -1,4 +1,4 @@
-"""Left side panel: video download (YouTube, Reddit, TikTok, Instagram), media library and details of the selected media."""
+"""Left side panel: video download (YouTube, Twitch, Kick, Reddit, TikTok, Instagram), media library and details of the selected media."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ import os
 from typing import Callable, Optional
 
 from PySide6.QtCore import QModelIndex, QPoint, QRect, QRectF, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QFrame, QGridLayout, QHBoxLayout,
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen,
+                           QPixmap)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem, QMenu,
                                QProgressBar, QPushButton, QScrollArea, QSizePolicy,
                                QStyledItemDelegate, QStyleOptionViewItem, QToolButton,
                                QVBoxLayout, QWidget)
 
 from ..core.model import MediaSource
+from ..core import timecode as _timecode
 from ..core.timecode import format_duration, format_size
 from ..media import downloader as dl
 from ..settings import Settings
@@ -31,10 +33,12 @@ FOOTNOTE = ("Only download content you own or have the rights to use. You are re
             "for following copyright law and the site's terms. Only public posts work; "
             "ClipForge never asks for passwords or cookies.")
 URL_PLACEHOLDER = "Paste a video link"
-URL_TOOLTIP = "Paste a video link from YouTube, Reddit, TikTok or Instagram (Ctrl+L)"
+URL_TOOLTIP = ("Paste a video link from YouTube, Twitch, Kick, Reddit, TikTok or Instagram "
+               "(Ctrl+L)")
 UPDATE_HINT = "update the downloader"
-SITE_NAMES = {"youtube": "YouTube", "reddit": "Reddit", "tiktok": "TikTok",
-              "instagram": "Instagram"}
+SITE_NAMES = {"youtube": "YouTube", "twitch": "Twitch", "kick": "Kick", "reddit": "Reddit",
+              "tiktok": "TikTok", "instagram": "Instagram"}
+MIN_SECTION = 0.5
 
 ROW_HEIGHT = 58
 POSTER_W, POSTER_H = 64, 40
@@ -47,6 +51,65 @@ OFFLINE_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
 # ----------------------------------------------------------------- formatting
+_TIME_HINT = "Use a time like 90, 1:30 or 1:02:03"
+
+
+def _parse_time(text: str) -> float:
+    """``parse_timecode`` from the core when present, else the same grammar locally."""
+    fn = getattr(_timecode, "parse_timecode", None)
+    if fn is not None:
+        return float(fn(text))
+    parts = text.split(":")
+    if not text or len(parts) > 3:
+        raise ValueError(_TIME_HINT)
+    try:
+        nums = [float(p) for p in parts]
+    except ValueError:
+        raise ValueError(_TIME_HINT) from None
+    if any(not (0 <= n < float("inf")) for n in nums):
+        raise ValueError(_TIME_HINT)
+    total = 0.0
+    for n in nums:
+        total = total * 60 + n
+    return total
+
+
+def format_clock(seconds: float) -> str:
+    """``1:30`` / ``1:02:03`` / ``1:30.5``: whole seconds unless a tenth is needed."""
+    t = round(max(0.0, seconds), 1)
+    whole = int(t)
+    tenth = int(round((t - whole) * 10))
+    return format_duration(whole) + (f".{tenth}" if tenth else "")
+
+
+def validate_section(start_text: str, end_text: str, duration: float, end_default: str = ""):
+    """Check the section fields: ``(range or None, error, error_field, readout)``.
+
+    Empty fields mean 0:00 / the video's end. ``end_default`` is the text the End field was
+    pre-filled with: leaving it untouched means exactly the full duration."""
+    st = "".join(start_text.split())
+    en = "".join(end_text.split())
+    try:
+        start = _parse_time(st) if st else 0.0
+    except ValueError as exc:
+        return None, str(exc) or "Invalid start time", "start", ""
+    try:
+        end = duration if (not en or en == "".join(end_default.split())) else _parse_time(en)
+    except ValueError as exc:
+        return None, str(exc) or "Invalid end time", "end", ""
+    if start >= duration:
+        return None, f"Start is past the video length ({format_clock(duration)})", "start", ""
+    if end > duration + 1e-6:
+        return None, f"End is past the video length ({format_clock(duration)})", "end", ""
+    if end <= start:
+        return None, "End must be after start", "end", ""
+    if end - start < MIN_SECTION:
+        return None, "The section must be at least 0.5 seconds", "end", ""
+    readout = (f"Section: {format_clock(end - start)} "
+               f"(from {format_clock(start)} to {format_clock(end)})")
+    return (start, end), "", "", readout
+
+
 def media_meta_text(src: MediaSource) -> str:
     """``1920×1080 · 30 fps · 0:42`` (parts that are unknown are left out)."""
     parts = []
@@ -257,6 +320,8 @@ class LeftPanel(QWidget):
         self._meta_job = None
         self._dl_job = None
         self._dl_args = None
+        self._section: Optional[tuple[float, float]] = None   # valid range, when enabled
+        self._section_default_end = ""
         self._old_jobs: list = []
         self._quality = ""
         self._posters: dict[str, QPixmap] = {}
@@ -338,6 +403,37 @@ class LeftPanel(QWidget):
         col.addLayout(meta_row)
         card.addLayout(col, 1)
         lay.addWidget(self.info_card)
+
+        self.section_box = QWidget()
+        sb = QVBoxLayout(self.section_box)
+        sb.setContentsMargins(0, 0, 0, 0)
+        sb.setSpacing(6)
+        self.section_check = QCheckBox("Download only a section")
+        self.section_check.setToolTip("Download just part of a long video or stream recording")
+        sb.addWidget(self.section_check)
+        self.section_fields = QWidget()
+        sf = QHBoxLayout(self.section_fields)
+        sf.setContentsMargins(0, 0, 0, 0)
+        sf.setSpacing(6)
+        mono = QFont()
+        mono.setFamilies([f.strip() for f in theme.MONO_FAMILY.split(",")])
+        self.section_start = QLineEdit()
+        self.section_end = QLineEdit()
+        for edit, tip in ((self.section_start, "Start time, e.g. 90, 1:30 or 1:02:03"),
+                          (self.section_end, "End time, e.g. 90, 1:30 or 1:02:03")):
+            edit.setFont(mono)
+            edit.setToolTip(tip)
+            edit.setMinimumWidth(60)
+            edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        sf.addWidget(make_label("Start", "faint"))
+        sf.addWidget(self.section_start, 1)
+        sf.addSpacing(4)
+        sf.addWidget(make_label("End", "faint"))
+        sf.addWidget(self.section_end, 1)
+        sb.addWidget(self.section_fields)
+        self.section_readout = make_label("", "dim", wrap=True)
+        sb.addWidget(self.section_readout)
+        lay.addWidget(self.section_box)
 
         self.quality_row = QWidget()
         qr = QHBoxLayout(self.quality_row)
@@ -460,6 +556,11 @@ class LeftPanel(QWidget):
         self.url_edit.textChanged.connect(self._on_url_text)
         self.url_edit.returnPressed.connect(self.validate_now)
         self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+        self.section_check.toggled.connect(self._on_section_toggled)
+        self.section_start.textChanged.connect(self._update_section)
+        self.section_end.textChanged.connect(self._update_section)
+        self.section_start.returnPressed.connect(self.section_end.setFocus)
+        self.section_end.returnPressed.connect(self._on_section_enter)
         self.download_button.clicked.connect(self.start_download)
         self.cancel_button.clicked.connect(self.cancel_download)
         self.retry_button.clicked.connect(self._on_retry)
@@ -495,8 +596,13 @@ class LeftPanel(QWidget):
         self.fetch_label.setVisible(st == "fetching")
         self.info_card.setVisible(self._info is not None)
         self.quality_row.setVisible(self._info is not None and st == "ready")
+        checked = self.section_check.isChecked()
+        self.section_box.setVisible(self._section_offered() and st == "ready")
+        self.section_fields.setVisible(checked)
+        self.section_readout.setVisible(checked)
         self.download_button.setEnabled(self._info is not None and st == "ready"
-                                        and not getattr(self._info, "is_live", False))
+                                        and not getattr(self._info, "is_live", False)
+                                        and (not checked or self._section is not None))
         self.progress_box.setVisible(st == "downloading")
         self.cancel_button.setEnabled(not self._cancelling)
         self.message_box.setVisible(st == "message")
@@ -508,6 +614,55 @@ class LeftPanel(QWidget):
             bool(self._message) and self._message[1] == "error"
             and UPDATE_HINT in self._message[0].lower())
         self.footnote.setVisible(True)
+
+    # ---------------------------------------------------------------- section
+    def _section_offered(self) -> bool:
+        info = self._info
+        return (info is not None and not getattr(info, "is_live", False)
+                and (getattr(info, "duration", 0) or 0) > MIN_SECTION)
+
+    def section_range(self) -> Optional[tuple[float, float]]:
+        """The valid (start, end) in seconds when "Download only a section" is on, else None."""
+        return self._section if self.section_check.isChecked() else None
+
+    def _reset_section(self, info) -> None:
+        dur = float(getattr(info, "duration", 0) or 0)
+        self._section_default_end = format_clock(dur) if dur > 0 else ""
+        for edit, text in ((self.section_start, "0:00"), (self.section_end,
+                                                          self._section_default_end)):
+            edit.blockSignals(True)
+            edit.setPlaceholderText(text)
+            edit.setText(text)
+            edit.blockSignals(False)
+        self.section_check.blockSignals(True)
+        self.section_check.setChecked(False)
+        self.section_check.blockSignals(False)
+        self._update_section()
+
+    def _on_section_toggled(self, on: bool) -> None:
+        self._update_section()
+        if on:
+            self.section_start.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.section_start.selectAll()
+
+    def _update_section(self, *_args) -> None:
+        info = self._info
+        if info is None:
+            self._section = None
+            return
+        dur = float(getattr(info, "duration", 0) or 0)
+        rng, err, field, readout = validate_section(
+            self.section_start.text(), self.section_end.text(), dur, self._section_default_end)
+        self._section = rng
+        set_prop(self.section_start, "state", "error" if field == "start" else "")
+        set_prop(self.section_end, "state", "error" if field == "end" else "")
+        self.section_readout.setText(err or readout)
+        set_prop(self.section_readout, "role", "error" if err else "dim")
+        self._sync()
+
+    def _on_section_enter(self) -> None:
+        if self.download_button.isEnabled():
+            self.start_download()
 
     # -------------------------------------------------------------- url field
     def _on_url_text(self, _text: str) -> None:
@@ -641,6 +796,7 @@ class LeftPanel(QWidget):
         self.info_site.setVisible(site != "youtube")
         self.info_thumb.set_image_data(getattr(info, "thumbnail_jpeg", b"") or b"")
         self._fill_qualities(info)
+        self._reset_section(info)
         if live:
             self._set_url_state("error", "Live streams can't be downloaded.")
 
@@ -695,15 +851,22 @@ class LeftPanel(QWidget):
     def start_download(self) -> None:
         if self._info is None or self._downloading:
             return
-        self._launch_download(self._info, self.selected_quality())
+        section = self.section_range()
+        if self.section_check.isChecked() and section is None:
+            return
+        self._launch_download(self._info, self.selected_quality(), section)
 
-    def _launch_download(self, info, quality: str) -> None:
+    def _launch_download(self, info, quality: str,
+                         section: Optional[tuple[float, float]] = None) -> None:
         self._message = None
         self._retry = None
         self._cancelling = False
         try:
             dest = str(self.settings.download_path())
-            job = dl.DownloadJob(info, quality, dest, self)
+            if section is None:
+                job = dl.DownloadJob(info, quality, dest, self)
+            else:
+                job = dl.DownloadJob(info, quality, dest, self, section=section)
             job.progress.connect(self._on_dl_progress)
             job.stage.connect(self._on_dl_stage)
             job.finished.connect(self._on_dl_finished)
@@ -712,10 +875,10 @@ class LeftPanel(QWidget):
         except Exception as exc:  # noqa: BLE001
             log.exception("Could not create download job")
             self._show_message(f"Could not start the download. {exc}", "error",
-                               lambda: self._launch_download(info, quality))
+                               lambda: self._launch_download(info, quality, section))
             return
         self._dl_job = job
-        self._dl_args = (info, quality)
+        self._dl_args = (info, quality, section)
         self._downloading = True
         self.progress_bar.setRange(0, 0)         # busy until the first progress report
         self.progress_label.setText("Starting…")
@@ -730,7 +893,8 @@ class LeftPanel(QWidget):
             return
         if fraction is None or fraction < 0:
             self.progress_bar.setRange(0, 0)
-            self.progress_label.setText(speed or "Working…")
+            busy = "Downloading section…" if self._dl_args and self._dl_args[2] else "Working…"
+            self.progress_label.setText(speed or busy)
             return
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(int(min(1.0, fraction) * 1000))
@@ -767,7 +931,12 @@ class LeftPanel(QWidget):
         self._set_url_state("", "")
         self.info_thumb.set_image(None)
         self._sync()
-        self.statusMessage.emit(f"Downloaded {os.path.basename(path)}")
+        section = self._dl_args[2] if self._dl_args else None
+        if section:
+            self.statusMessage.emit(f"Downloaded section {format_clock(section[0])}–"
+                                    f"{format_clock(section[1])}")
+        else:
+            self.statusMessage.emit(f"Downloaded {os.path.basename(path)}")
         self.downloadFinished.emit(path, info)
 
     @Slot(str)
@@ -776,9 +945,9 @@ class LeftPanel(QWidget):
         if job is not self._dl_job:
             return
         self._end_download(job)
-        info, quality = self._dl_args
+        info, quality, section = self._dl_args
         self._show_message(message or "The download failed.", "error",
-                           lambda: self._launch_download(info, quality))
+                           lambda: self._launch_download(info, quality, section))
         self.statusMessage.emit("Download failed")
 
     @Slot()
@@ -787,9 +956,9 @@ class LeftPanel(QWidget):
         if job is not self._dl_job:
             return
         self._end_download(job)
-        info, quality = self._dl_args
+        info, quality, section = self._dl_args
         self._show_message("Download cancelled.", "dim",
-                           lambda: self._launch_download(info, quality))
+                           lambda: self._launch_download(info, quality, section))
         self.statusMessage.emit("Download cancelled")
 
     def cancel_download(self) -> None:

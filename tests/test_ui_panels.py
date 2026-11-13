@@ -834,7 +834,8 @@ def test_settings_cache_size_and_clear_only_cache_subdirs(app, backend, settings
 def test_settings_footer_versions(app, backend, settings):
     d = SettingsDialog(settings)
     settle(app)
-    assert "1.0.0" in d.version_label.text()
+    from clipforge import __version__
+    assert __version__ in d.version_label.text()
     assert d.ffmpeg_label.text() == "FFmpeg 8.1.3"
 
 

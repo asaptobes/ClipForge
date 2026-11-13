@@ -82,6 +82,7 @@ ICONS: dict[str, str] = {
                '<path d="M10 9.2v5.6l5-2.8z" fill="{color}" stroke="none"/>',
     "speed": '<path d="M4.5 17a9 9 0 1 1 15 0"/><path d="M12 13l4-5"/><circle cx="12" cy="13.5" r="1.2" fill="{color}"/>',
     "cursor": '<path d="M5 3l14 7-6 2-2 6z"/>',
+    "captions": '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 10.5h3.5M13 10.5h4M7 14h5M14.5 14H17"/>',
     "eye": '<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
 }
 

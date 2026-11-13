@@ -1150,3 +1150,37 @@ def test_audio_lane_serialises_with_track():
     assert Segment.from_dict(a.to_dict()).track == "audio"
     old = seg.to_dict(); old.pop("track")
     assert Segment.from_dict(old).track == "video"       # older project files
+
+
+# ------------------------------------------------------------ reframe / captions
+def test_crop_pan_interpolates_and_split_keeps_continuity():
+    from clipforge.core.model import MediaSource, Timeline
+    src = MediaSource(id="s", path="x.mp4", duration=10.0, fps=25.0)
+    tl = Timeline({"s": src})
+    seg = tl.append_source(src)
+    tl.set_crop([seg.id], 0.2, 0.8)
+    assert abs(seg.crop_x_at(5.0) - 0.5) < 1e-9
+    left, right = tl.split(seg.id, 5.0)
+    assert (left.crop_x, left.crop_x_end) == (0.2, 0.5)
+    assert (right.crop_x, right.crop_x_end) == (0.5, 0.8)
+
+
+def test_set_crop_validates_and_clamps():
+    import pytest
+    from clipforge.core.model import EditError, MediaSource, Timeline
+    src = MediaSource(id="s", path="x.mp4", duration=4.0)
+    tl = Timeline({"s": src})
+    seg = tl.append_source(src)
+    tl.set_crop([seg.id], 1.7)
+    assert seg.crop_x == 1.0
+    with pytest.raises(EditError):
+        tl.set_crop([seg.id], 1.0)          # nothing changes
+    with pytest.raises(EditError):
+        tl.set_crop(["nope"], 0.3)
+
+
+def test_old_project_dict_without_crop_loads():
+    from clipforge.core.model import Segment
+    d = {"id": "a", "source_id": "s", "source_in": 0, "source_out": 1, "timeline_start": 0}
+    seg = Segment.from_dict(d)
+    assert seg.crop_x == 0.5 and seg.crop_x_end is None

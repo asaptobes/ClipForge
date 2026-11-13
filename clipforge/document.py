@@ -13,6 +13,9 @@ from typing import Iterable, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from dataclasses import replace
+
+from .core.captions import CaptionLine, CaptionStyle, timeline_stamp
 from .core.history import History
 from .core.model import EditError, ExportSettings, MediaSource, Segment, Timeline
 from .core.project import Project
@@ -30,6 +33,8 @@ class Document(QObject):
     playheadChanged = Signal(float)   # timeline seconds; emitted for every move
     seekRequested = Signal(float)     # user asked to jump: the player must seek
     message = Signal(str)             # short status-bar text (e.g. why an edit was refused)
+    canvasChanged = Signal()          # output aspect / reframe mode changed
+    captionsChanged = Signal()        # caption lines, style or staleness changed
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -104,6 +109,8 @@ class Document(QObject):
         self.timelineChanged.emit()
         self.selectionChanged.emit()
         self.historyChanged.emit()
+        self.captionsChanged.emit()
+        self.canvasChanged.emit()
         self.dirtyChanged.emit(False)
         self.playheadChanged.emit(self.project.playhead)
         self.seekRequested.emit(self.project.playhead)
@@ -318,6 +325,109 @@ class Document(QObject):
         self._committed("Detach audio", before)
         self.select([a.id for a in made])
         return True
+
+    def set_crop(self, segment_ids: Iterable[str], x: float, x_end: Optional[float] = None) -> bool:
+        """Reframe crop position for video clips (0 left .. 1 right; ``x_end`` pans). One undo step."""
+        before = self.timeline.snapshot()
+        try:
+            self.timeline.set_crop(segment_ids, x, x_end)
+        except EditError as exc:
+            return self._refuse(exc)
+        self._committed("Reframe clip", before)
+        return True
+
+    # ---------------------------------------------------------------- canvas
+    @property
+    def aspect(self) -> str:
+        return self.project.export.aspect
+
+    @property
+    def reframe_mode(self) -> str:
+        return self.project.export.reframe
+
+    def set_canvas(self, aspect: Optional[str] = None, reframe: Optional[str] = None) -> None:
+        """Choose the output shape ("source", "9:16", "4:5", "1:1", "16:9") and how clips
+        fill it ("fill", "blur", "fit"). Not an undo step; marks the project dirty."""
+        new = self.project.export
+        if aspect is not None:
+            if aspect not in ("source", "9:16", "4:5", "1:1", "16:9"):
+                raise ValueError(f"unknown aspect {aspect!r}")
+            new = replace(new, aspect=aspect)
+        if reframe is not None:
+            if reframe not in ("fill", "blur", "fit"):
+                raise ValueError(f"unknown reframe mode {reframe!r}")
+            new = replace(new, reframe=reframe)
+        if new != self.project.export:
+            self.project.export = new
+            self._set_dirty(True)
+            self.canvasChanged.emit()
+
+    # --------------------------------------------------------------- captions
+    @property
+    def captions(self) -> list[CaptionLine]:
+        return self.project.captions
+
+    @property
+    def caption_style(self) -> CaptionStyle:
+        return self.project.caption_style
+
+    def captions_stale(self) -> bool:
+        """True when captions exist but the timeline changed since they were generated."""
+        p = self.project
+        return bool(p.captions) and p.captions_stamp != timeline_stamp(self.timeline.all_segments())
+
+    def set_captions(self, lines: Iterable[CaptionLine], style: Optional[CaptionStyle] = None) -> None:
+        """Replace all captions (e.g. after transcription) and mark them as matching the
+        timeline as it is now. Not an undo step."""
+        p = self.project
+        p.captions = sorted((ln.copy() for ln in lines), key=lambda ln: ln.start)
+        if style is not None:
+            p.caption_style = style
+        p.captions_stamp = timeline_stamp(self.timeline.all_segments())
+        self._set_dirty(True)
+        self.captionsChanged.emit()
+
+    def clear_captions(self) -> None:
+        if self.project.captions:
+            self.project.captions = []
+            self.project.captions_stamp = ""
+            self._set_dirty(True)
+            self.captionsChanged.emit()
+
+    def edit_caption(self, index: int, text: Optional[str] = None, start: Optional[float] = None,
+                     end: Optional[float] = None) -> bool:
+        """Change one caption's text or timing. Editing text drops its per-word timing
+        (the whole line is then shown at once)."""
+        try:
+            ln = self.project.captions[index]
+        except IndexError:
+            return False
+        if text is not None and text != ln.text:
+            ln.text, ln.words = text, []
+        if start is not None:
+            ln.start = max(0.0, float(start))
+        if end is not None:
+            ln.end = float(end)
+        if ln.end <= ln.start:
+            ln.end = ln.start + 0.2
+        self.project.captions.sort(key=lambda c: c.start)
+        self._set_dirty(True)
+        self.captionsChanged.emit()
+        return True
+
+    def delete_caption(self, index: int) -> bool:
+        if not 0 <= index < len(self.project.captions):
+            return False
+        del self.project.captions[index]
+        self._set_dirty(True)
+        self.captionsChanged.emit()
+        return True
+
+    def set_caption_style(self, style: CaptionStyle) -> None:
+        if style != self.project.caption_style:
+            self.project.caption_style = style
+            self._set_dirty(True)
+            self.captionsChanged.emit()
 
     def close_gaps(self) -> bool:
         before = self.timeline.snapshot()

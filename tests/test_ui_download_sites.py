@@ -45,7 +45,7 @@ def site_info(site="reddit", only_best=True):
 # ------------------------------------------------------------------ left panel
 def test_placeholder_and_footnote(panel):
     assert panel.url_edit.placeholderText() == "Paste a video link"
-    for site in ("YouTube", "Reddit", "TikTok", "Instagram"):
+    for site in ("YouTube", "Twitch", "Kick", "Reddit", "TikTok", "Instagram"):
         assert site in panel.url_edit.toolTip()
     assert "public posts" in panel.footnote.text()
     assert "rights to use" in panel.footnote.text()
@@ -66,6 +66,12 @@ def test_non_youtube_chip_and_best_available(panel):
     assert not panel.quality_combo.isEnabled()
     assert panel.selected_quality() == "best"
     assert panel.download_button.isEnabled()
+
+
+@pytest.mark.parametrize("key,name", [("twitch", "Twitch"), ("kick", "Kick")])
+def test_twitch_kick_chip(panel, key, name):
+    open_url(panel, info=site_info(key))
+    assert not panel.info_site.isHidden() and panel.info_site.text() == name
 
 
 def test_quality_list_restored_after_non_youtube(panel):

@@ -6,7 +6,7 @@ Output:      dist\\ClipForge\\ClipForge.exe
 """
 import os
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = os.path.abspath(os.getcwd())
 FFMPEG_DIR = os.path.join(ROOT, "vendor", "ffmpeg")
@@ -21,6 +21,9 @@ else:
     print("WARNING: vendor/ffmpeg not found - the build will rely on FFmpeg being on PATH")
 
 hiddenimports = collect_submodules("yt_dlp") + ["av", "numpy"]
+# local auto-captions: faster-whisper ships its VAD model as a data file (silero_vad_v6.onnx)
+datas += collect_data_files("faster_whisper")
+hiddenimports += ["faster_whisper", "ctranslate2"]
 
 # Qt modules ClipForge never uses - leaving them out saves several hundred MB.
 excludes = [

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .captions import (CaptionLine, CaptionStyle, lines_from_dicts, lines_to_dicts)
 from .history import History
 from .model import ExportSettings, MediaSource, Segment, Timeline
 
@@ -34,6 +35,9 @@ class Project:
     export: ExportSettings = field(default_factory=ExportSettings)
     playhead: float = 0.0
     path: Optional[str] = None
+    captions: list = field(default_factory=list)            # list[CaptionLine], timeline time
+    caption_style: CaptionStyle = field(default_factory=CaptionStyle)
+    captions_stamp: str = ""        # timeline_stamp() the captions were generated from
 
     def __post_init__(self) -> None:
         if self.timeline is None:
@@ -70,6 +74,9 @@ class Project:
             "playhead": self.playhead,
             "export": self.export.to_dict(),
             "history": self.history.to_dict(),
+            "captions": lines_to_dicts(self.captions),
+            "caption_style": self.caption_style.to_dict(),
+            "captions_stamp": self.captions_stamp,
         }
 
     def save(self, path: str) -> None:
@@ -126,7 +133,10 @@ class Project:
             segments = [s for s in segments if s.source_id in sources]
             project = cls(sources=sources, timeline=Timeline(sources, segments),
                           export=ExportSettings.from_dict(data.get("export", {})),
-                          playhead=float(data.get("playhead", 0.0)), path=path)
+                          playhead=float(data.get("playhead", 0.0)), path=path,
+                          captions=lines_from_dicts(data.get("captions")),
+                          caption_style=CaptionStyle.from_dict(data.get("caption_style")),
+                          captions_stamp=str(data.get("captions_stamp", "")))
             project.history.load_dict(data.get("history", {}))
             for entry in project.history.undo_stack + project.history.redo_stack:
                 # same rule as for the live timeline: never keep clips of unknown media

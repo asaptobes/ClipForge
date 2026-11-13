@@ -117,6 +117,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          getattr(yt_dlp, "__file__", "?"))
             except Exception:  # noqa: BLE001
                 log.warning("Smoke test: could not report yt-dlp", exc_info=True)
+            try:
+                import os as _os
+                import faster_whisper
+                from .media import transcribe
+                vad = _os.path.join(_os.path.dirname(faster_whisper.__file__), "assets",
+                                    "silero_vad_v6.onnx")
+                log.info("Smoke test: captions engine available=%s, VAD model present=%s",
+                         transcribe.is_available(), _os.path.isfile(vad))
+            except Exception:  # noqa: BLE001
+                log.warning("Smoke test: captions engine not available", exc_info=True)
             window.document._set_dirty(False)  # never prompt during the automated check
             window.close()
             app.exit(3 if missing else 0)

@@ -3,6 +3,7 @@ PySide6>=6.7
 yt-dlp>=2025.1.1
 av>=13
 numpy>=1.26
+faster-whisper>=1.2.1   # local captions (pulls ctranslate2, onnxruntime, tokenizers, huggingface-hub)
 
 # Development / build
 pytest>=8

@@ -211,6 +211,9 @@ QPushButton[variant="danger"]:hover {{ border-color: {p.danger}; }}
 QPushButton[variant="ghost"] {{ background: transparent; border-color: transparent; }}
 QPushButton[variant="ghost"]:hover {{ background: {p.raised}; }}
 
+QPushButton[variant="segment"] {{ padding: 5px 12px; border-radius: {rs}px; }}
+QPushButton[variant="segment"]:checked {{ background: {p.selection}; border-color: {p.accent}; font-weight: 600; }}
+
 QToolButton {{ background: transparent; border: 1px solid transparent; border-radius: {rs}px;
               padding: 5px; }}
 QToolButton:hover {{ background: {p.raised}; border-color: {p.border}; }}
@@ -281,6 +284,15 @@ QListWidget, QListView, QTreeView {{ background: {p.panel_alt}; border: 1px soli
 QListWidget::item, QListView::item {{ border-radius: {rs}px; padding: 4px; margin: 1px 0; }}
 QListWidget::item:hover, QListView::item:hover {{ background: {p.raised}; }}
 QListWidget::item:selected, QListView::item:selected {{ background: {p.selection}; color: {p.text}; }}
+QTableView {{ background: {p.panel_alt}; border: 1px solid {p.border}; border-radius: {r}px;
+    gridline-color: transparent; selection-background-color: {p.selection}; selection-color: {p.text}; }}
+QTableView::item {{ padding: 3px 8px; border: none; }}
+QTableView::item:selected {{ background: {p.selection}; color: {p.text}; }}
+QTableView QLineEdit {{ padding: 2px 6px; border-radius: 4px; }}
+QHeaderView {{ background: transparent; }}
+QHeaderView::section {{ background: {p.panel_alt}; color: {p.text_faint}; border: none;
+    border-bottom: 1px solid {p.border}; padding: 6px 8px; font-size: 11px; font-weight: 600; }}
+QTableCornerButton::section {{ background: {p.panel_alt}; border: none; }}
 QMenu {{ background: {p.raised}; border: 1px solid {p.border_strong}; border-radius: {r}px; padding: 5px; }}
 QMenu::item {{ padding: 6px 22px 6px 12px; border-radius: 4px; }}
 QMenu::item:selected {{ background: {p.selection}; }}
