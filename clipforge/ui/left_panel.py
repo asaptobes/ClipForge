@@ -1,4 +1,4 @@
-"""Left side panel: YouTube download, media library and details of the selected media."""
+"""Left side panel: video download (YouTube, Reddit, TikTok, Instagram), media library and details of the selected media."""
 
 from __future__ import annotations
 
@@ -28,7 +28,13 @@ log = logging.getLogger(__name__)
 QUALITY_LABELS = {"best": "Best", "2160": "2160p · 4K", "1440": "1440p",
                   "1080": "1080p", "720": "720p", "480": "480p"}
 FOOTNOTE = ("Only download content you own or have the rights to use. You are responsible "
-            "for following copyright law and the site's terms.")
+            "for following copyright law and the site's terms. Only public posts work; "
+            "ClipForge never asks for passwords or cookies.")
+URL_PLACEHOLDER = "Paste a video link"
+URL_TOOLTIP = "Paste a video link from YouTube, Reddit, TikTok or Instagram (Ctrl+L)"
+UPDATE_HINT = "update the downloader"
+SITE_NAMES = {"youtube": "YouTube", "reddit": "Reddit", "tiktok": "TikTok",
+              "instagram": "Instagram"}
 
 ROW_HEIGHT = 58
 POSTER_W, POSTER_H = 64, 40
@@ -230,6 +236,7 @@ class LeftPanel(QWidget):
     importRequested = Signal()
     relinkRequested = Signal(str)              # source id
     statusMessage = Signal(str)
+    openSettingsRequested = Signal()           # error hint: "Open Settings" (Downloader section)
 
     DEBOUNCE_MS = 350
 
@@ -293,9 +300,9 @@ class LeftPanel(QWidget):
         lay.addLayout(head)
 
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Paste a YouTube link")
+        self.url_edit.setPlaceholderText(URL_PLACEHOLDER)
         self.url_edit.setClearButtonEnabled(True)
-        self.url_edit.setToolTip("Paste a YouTube video, Shorts or youtu.be link (Ctrl+L)")
+        self.url_edit.setToolTip(URL_TOOLTIP)
         lay.addWidget(self.url_edit)
         self.url_error = make_label("", "error", wrap=True)
         self.url_error.setVisible(False)
@@ -319,7 +326,11 @@ class LeftPanel(QWidget):
         self.info_duration = make_label("", "faint")
         self.info_badge = make_label("Short", "badge")
         self.info_badge.setFixedHeight(20)
+        self.info_site = make_label("", "badge")
+        self.info_site.setFixedHeight(20)
+        self.info_site.setVisible(False)
         meta_row.addWidget(self.info_duration)
+        meta_row.addWidget(self.info_site)
         meta_row.addWidget(self.info_badge)
         meta_row.addStretch(1)
         col.addWidget(self.info_title)
@@ -368,10 +379,17 @@ class LeftPanel(QWidget):
         mrow = QHBoxLayout()
         self.retry_button = primary_button("Retry", "retry")
         self.dismiss_button = plain_button("Dismiss")
+        self.settings_button = plain_button("Open Settings", "settings", variant="ghost")
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setToolTip("Open Settings to update the downloader")
         mrow.addWidget(self.retry_button)
         mrow.addWidget(self.dismiss_button)
         mrow.addStretch(1)
         mb.addWidget(self.message_label)
+        srow = QHBoxLayout()
+        srow.addWidget(self.settings_button)
+        srow.addStretch(1)
+        mb.addLayout(srow)
         mb.addLayout(mrow)
         lay.addWidget(self.message_box)
 
@@ -446,6 +464,7 @@ class LeftPanel(QWidget):
         self.cancel_button.clicked.connect(self.cancel_download)
         self.retry_button.clicked.connect(self._on_retry)
         self.dismiss_button.clicked.connect(self.dismiss_message)
+        self.settings_button.clicked.connect(self.openSettingsRequested)
         self.import_button.clicked.connect(self.importRequested)
         self.import_tool.clicked.connect(self.importRequested)
         ml = self.media_list
@@ -485,6 +504,9 @@ class LeftPanel(QWidget):
             self.message_label.setText(self._message[0])
             set_prop(self.message_label, "role", self._message[1])
         self.retry_button.setVisible(self._retry is not None)
+        self.settings_button.setVisible(
+            bool(self._message) and self._message[1] == "error"
+            and UPDATE_HINT in self._message[0].lower())
         self.footnote.setVisible(True)
 
     # -------------------------------------------------------------- url field
@@ -506,7 +528,7 @@ class LeftPanel(QWidget):
         try:
             url = dl.validate_url(text)
         except Exception as exc:  # noqa: BLE001 - MediaError carries a friendly message
-            self._set_url_state("error", str(exc) or "That doesn't look like a YouTube link.")
+            self._set_url_state("error", str(exc) or "That doesn't look like a supported link.")
             self._reset_info()
             return
         self._set_url_state("ok", "")
@@ -613,6 +635,10 @@ class LeftPanel(QWidget):
         live = getattr(info, "is_live", False)
         self.info_duration.setText("Live" if live else (format_duration(dur) if dur else ""))
         self.info_badge.setVisible(bool(getattr(info, "is_short", False)))
+        site = str(getattr(info, "site", "") or "youtube")
+        self.info_site.setText(SITE_NAMES.get(site, site.title()))
+        self.info_site.setToolTip(f"Source: {self.info_site.text()}")
+        self.info_site.setVisible(site != "youtube")
         self.info_thumb.set_image_data(getattr(info, "thumbnail_jpeg", b"") or b"")
         self._fill_qualities(info)
         if live:
@@ -630,6 +656,14 @@ class LeftPanel(QWidget):
             item.setEnabled(ok)
             combo.setItemData(i, None if ok else "Not offered by this video",
                               Qt.ItemDataRole.ToolTipRole)
+        only_best = not any(ok for k, ok in avail.items() if k != "best")
+        if only_best:
+            combo.setItemText(0, "Best available")
+            combo.setToolTip("This site offers a single quality; the best one is downloaded")
+        else:
+            combo.setItemText(0, QUALITY_LABELS["best"])
+            combo.setToolTip("Maximum video quality to download")
+        combo.setEnabled(not only_best)
         combo.blockSignals(False)
         self.set_default_quality()
 

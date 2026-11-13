@@ -9,15 +9,19 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QGridLayout, QHBoxLayout, QMessageBox,
-                               QVBoxLayout, QWidget)
+                               QProgressBar, QVBoxLayout, QWidget)
 
 from .. import __app_name__, __version__, paths
 from ..media import ffmpeg
 from ..core.timecode import format_size
+try:  # the downloader updater lives in the media package; the dialog works without it
+    from ..media.ytdlp_update import UpdateJob, clear_override, installed_version
+except ImportError:  # pragma: no cover - only while the module is missing
+    UpdateJob = clear_override = installed_version = None
 from ..settings import Settings
 from .support_dialog import open_support_page
 from .widgets import (DOT, PathField, folder_problem, heading, hseparator, make_label,
-                      open_path, plain_button, primary_button, run_task)
+                      open_path, plain_button, primary_button, run_task, set_prop)
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +93,8 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(580)
         self._cache_token = 0
+        self._update_job = None
+        self._update_running = False
         self._build()
         self.load_from(settings)
         self._refresh_cache_size()
@@ -137,6 +143,33 @@ class SettingsDialog(QDialog):
         self._add_row("Theme", self.theme_combo)
         self._add_row("", make_label("The theme is applied everywhere after ClipForge restarts.",
                                      "faint", wrap=True, shrinkable=False))
+        self._section("Downloader")
+        self.ytdlp_version_label = make_label("", "dim", selectable=True)
+        self._add_row("yt-dlp version", self.ytdlp_version_label)
+        update_row = QHBoxLayout()
+        self.update_button = plain_button("Check for updates", "retry")
+        self.reset_ytdlp_button = plain_button("Reset to bundled version", variant="ghost")
+        self.reset_ytdlp_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        update_row.addWidget(self.update_button)
+        update_row.addWidget(self.reset_ytdlp_button)
+        update_row.addStretch(1)
+        self._add_row("", update_row)
+        status_col = QVBoxLayout()
+        status_col.setSpacing(6)
+        self.update_progress = QProgressBar()
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setTextVisible(False)
+        self.update_progress.setVisible(False)
+        self.update_status = make_label("", "dim", wrap=True, shrinkable=False)
+        self.update_status.setVisible(False)
+        status_col.addWidget(self.update_progress)
+        status_col.addWidget(self.update_status)
+        self._add_row("", status_col)
+        self._add_row("", make_label("Sites change often; updating the downloader fixes most "
+                                     "“can’t download” problems.",
+                                     "faint", wrap=True, shrinkable=False))
+        self._refresh_ytdlp_version()
+
         self._section("Support")
         self.support_check = QCheckBox("Show the thank-you message at startup")
         self._add_row("", self.support_check)
@@ -180,6 +213,8 @@ class SettingsDialog(QDialog):
         self.restore_button.clicked.connect(self.restore_defaults)
         self.clear_cache_button.clicked.connect(self.clear_cache)
         self.log_button.clicked.connect(self._open_logs)
+        self.update_button.clicked.connect(self.check_for_updates)
+        self.reset_ytdlp_button.clicked.connect(self.reset_ytdlp)
         self.support_button.clicked.connect(open_support_page)
         self.cache_field.changed.connect(lambda _p: self._refresh_cache_size())
         for field in self.path_fields():
@@ -298,6 +333,134 @@ class SettingsDialog(QDialog):
     def _on_cache_clear_failed(self, message: str) -> None:
         self.clear_cache_button.setEnabled(True)
         self.cache_size_label.setText(f"Could not clear the cache: {message}")
+
+    # ------------------------------------------------------------ downloader
+    def focus_downloader(self) -> None:
+        """Put the keyboard focus on the downloader update button."""
+        self.update_button.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _refresh_ytdlp_version(self) -> None:
+        version = ""
+        if installed_version is not None:
+            try:
+                version = installed_version() or ""
+            except Exception:  # noqa: BLE001 - cosmetic
+                log.debug("installed_version failed", exc_info=True)
+        self.ytdlp_version_label.setText(version or "unknown")
+        self.update_button.setEnabled(UpdateJob is not None and not self._update_running)
+        self.reset_ytdlp_button.setEnabled(clear_override is not None
+                                           and not self._update_running)
+
+    def _set_update_status(self, text: str, role: str = "dim") -> None:
+        set_prop(self.update_status, "role", role)
+        self.update_status.setText(text)
+        self.update_status.setVisible(bool(text))
+
+    def is_updating(self) -> bool:
+        return self._update_running
+
+    def check_for_updates(self) -> None:
+        if self._update_running or UpdateJob is None:
+            return
+        try:
+            job = UpdateJob(self)
+            job.progress.connect(self._on_update_progress)
+            job.finished.connect(self._on_update_finished)
+            job.failed.connect(self._on_update_failed)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Could not start the downloader update")
+            self._set_update_status(f"Could not check for updates: {exc}", "error")
+            return
+        self._update_job = job
+        self._update_running = True
+        self.update_button.setEnabled(False)
+        self.reset_ytdlp_button.setEnabled(False)
+        self.update_progress.setRange(0, 0)
+        self.update_progress.setVisible(True)
+        self._set_update_status("Checking for updates…")
+        job.start()
+
+    def _end_update(self) -> None:
+        job, self._update_job = self._update_job, None
+        self._update_running = False
+        self.update_progress.setVisible(False)
+        if job is not None:
+            job.deleteLater()
+        self._refresh_ytdlp_version()
+
+    @Slot(float, str)
+    def _on_update_progress(self, fraction: float, text: str) -> None:
+        if self.sender() is not self._update_job:
+            return
+        if fraction is None or fraction < 0:
+            self.update_progress.setRange(0, 0)
+        else:
+            self.update_progress.setRange(0, 1000)
+            self.update_progress.setValue(int(min(1.0, fraction) * 1000))
+        if text:
+            self._set_update_status(text)
+
+    @Slot(str, bool)
+    def _on_update_finished(self, version: str, changed: bool) -> None:
+        if self.sender() is not self._update_job:
+            return
+        self._end_update()
+        if changed:
+            self._set_update_status(f"Updated to {version}. Restart ClipForge to use it.",
+                                    "success")
+        else:
+            self._set_update_status(f"You’re up to date (version {version}).", "success")
+
+    @Slot(str)
+    def _on_update_failed(self, message: str) -> None:
+        if self.sender() is not self._update_job:
+            return
+        self._end_update()
+        self._set_update_status(message or "The update failed.", "error")
+
+    def _stop_update(self) -> None:
+        """Cancel a running update and forget it (the dialog is closing)."""
+        job, self._update_job = self._update_job, None
+        self._update_running = False
+        if job is None:
+            return
+        for sig in (job.progress, job.finished, job.failed):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            job.cancel()
+        except Exception:  # noqa: BLE001
+            log.debug("update cancel failed", exc_info=True)
+
+    def done(self, result: int) -> None:  # noqa: D102 - QDialog override
+        self._stop_update()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._stop_update()
+        super().closeEvent(event)
+
+    def confirm_reset_ytdlp(self) -> bool:
+        box = QMessageBox(QMessageBox.Icon.Question, "Reset downloader?",
+                          "Go back to the downloader version that came with ClipForge? "
+                          "Downloaded updates are removed.",
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def reset_ytdlp(self) -> None:
+        if self._update_running or clear_override is None or not self.confirm_reset_ytdlp():
+            return
+        try:
+            clear_override()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Could not reset the downloader")
+            self._set_update_status(f"Could not reset the downloader: {exc}", "error")
+            return
+        self._set_update_status("Reset to the bundled version. Restart ClipForge to use it.",
+                                "success")
 
     # ---------------------------------------------------------------- footer
     @Slot(object)

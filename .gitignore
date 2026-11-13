@@ -10,3 +10,5 @@ vendor/
 *.log
 .claude/settings.local.json
 build_new/
+promo/
+tools/make_promo_v1.py

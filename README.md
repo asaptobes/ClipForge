@@ -1,12 +1,12 @@
 # ClipForge
 
-ClipForge is a Windows 10/11 desktop app that downloads YouTube videos and Shorts, lets you cut and rearrange them on a non-destructive timeline, and exports the result as an MP4.
+ClipForge is a Windows 10/11 desktop app that downloads videos from YouTube, Reddit, TikTok and public Instagram posts, lets you cut and rearrange them on a non-destructive timeline, and exports the result as an MP4.
 
 Built with Python 3.12, PySide6, yt-dlp, FFmpeg and PyInstaller.
 
 ## Features
 
-- Download a YouTube video or Short by pasting its link (`Ctrl+L`), choosing a quality.
+- Download a video by pasting its link (`Ctrl+L`) from YouTube (videos and Shorts), Reddit, TikTok or Instagram (public posts only), choosing a quality.
 - Import local video files (`.mp4`, `.mov`, `.mkv`, `.webm`, `.m4v`) with `Ctrl+I` or drag and drop.
 - Single-track timeline: split, delete, ripple delete, trim, reorder, mute, close gaps.
 - Undo and redo for every edit.
@@ -49,7 +49,7 @@ The app is not code-signed. If Windows or antivirus blocks it, see [Troubleshoot
 
 ### Get media onto the timeline
 
-- **Download:** paste a YouTube link (`Ctrl+L`), pick a quality, and download. Downloads are saved to `%USERPROFILE%\Videos\ClipForge\Downloads` by default.
+- **Download:** paste a YouTube, Reddit, TikTok or public Instagram link (`Ctrl+L`), pick a quality, and download. Instagram often asks for a login even for public posts; ClipForge never stores passwords or cookies, so those posts cannot be downloaded. Downloads are saved to `%USERPROFILE%\Videos\ClipForge\Downloads` by default.
 - **Import:** `Ctrl+I` opens a file picker. You can also drag video files into the window.
 - Add a media item to the timeline from the media list panel.
 
@@ -268,7 +268,9 @@ The app reports that `ffmpeg` was not found. Check that `ffmpeg.exe` and `ffprob
 
 ClipForge and the FFmpeg binaries are not code-signed, so Smart App Control or antivirus software may block them. Ask your IT department to allow the `ClipForge` folder, or run ClipForge from source as described above.
 
-### Downloads fail after YouTube changes
+### Downloads fail after a site changes
+
+In the app, open **Settings > Downloader > Check for updates** to fetch the newest yt-dlp (checksum-verified, applied after a restart). From source, you can also update it manually:
 
 YouTube changes often break downloads until yt-dlp is updated. In the venv, run:
 

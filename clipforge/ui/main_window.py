@@ -276,6 +276,7 @@ class MainWindow(QMainWindow):
         self.left_panel.importRequested.connect(self.import_dialog)
         self.left_panel.relinkRequested.connect(self.relink_source)
         self.left_panel.statusMessage.connect(self.show_status)
+        self.left_panel.openSettingsRequested.connect(self.open_settings_downloader)
         self.h_split.splitterMoved.connect(lambda *_: None)
 
     # ----------------------------------------------------------------- status
@@ -615,9 +616,15 @@ class MainWindow(QMainWindow):
         job.failed.connect(lambda msg: QMessageBox.warning(self, "Audio export failed", msg))
         job.start()
 
-    def open_settings(self) -> None:
+    def open_settings_downloader(self) -> None:
+        """Open Settings with the keyboard focus on the Downloader section."""
+        self.open_settings(focus_downloader=True)
+
+    def open_settings(self, focus_downloader: bool = False) -> None:
         old_theme, old_cache = self.settings.theme, self.settings.cache_dir
         dialog = SettingsDialog(self.settings, self)
+        if focus_downloader is True:
+            dialog.focus_downloader()
         accepted = dialog.exec()
         dialog.deleteLater()
         if not accepted:

@@ -110,6 +110,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         def finish() -> None:
             missing = ffmpeg.missing_dependencies()
             log.info("Smoke test: missing dependencies = %s", missing)
+            try:
+                import yt_dlp
+                from .media import ytdlp_update
+                log.info("Smoke test: yt-dlp %s from %s", ytdlp_update.installed_version(),
+                         getattr(yt_dlp, "__file__", "?"))
+            except Exception:  # noqa: BLE001
+                log.warning("Smoke test: could not report yt-dlp", exc_info=True)
             window.document._set_dirty(False)  # never prompt during the automated check
             window.close()
             app.exit(3 if missing else 0)
